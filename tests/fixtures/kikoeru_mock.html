@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <title>YuraSub Kikoeru Mock</title>
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font-family: "Microsoft YaHei UI", sans-serif;
+        background: #171717;
+        color: #f5f5f5;
+      }
+
+      main {
+        width: min(720px, calc(100vw - 48px));
+      }
+
+      #status {
+        margin-top: 16px;
+        color: #a3e635;
+        white-space: pre-wrap;
+      }
+
+      #lyric {
+        min-height: 64px;
+        padding: 24px;
+        border: 1px solid #525252;
+        font-size: 28px;
+        line-height: 1.5;
+        white-space: pre-line;
+      }
+
+      .controls {
+        display: flex;
+        gap: 12px;
+        margin-top: 16px;
+      }
+
+      button {
+        padding: 8px 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Kikoeru subtitle mock</h1>
+      <div class="subtitle">UZMR</div>
+      <p id="lyric">最初のテスト字幕です
+这是第一条测试翻译</p>
+      <div class="controls">
+        <button type="button" aria-label="上一首" id="prev">Previous</button>
+        <button type="button" aria-label="播放" id="play">Play/Pause</button>
+        <button type="button" aria-label="下一首" id="next">Next</button>
+      </div>
+      <audio src="data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA="></audio>
+      <pre id="status">pending</pre>
+    </main>
+    <script src="/userscript/yurasub.user.js"></script>
+    <script>
+      const lines = [
+        "最初のテスト字幕です\n这是第一条测试翻译",
+        "YuraSub userscript WebSocket test",
+        "",
+        "字幕ノード #lyric を更新しています\n正在更新 #lyric 字幕节点",
+      ];
+      const controls = { previous: 0, playPause: 0, next: 0 };
+      document.querySelector("#prev").addEventListener("click", () => {
+        controls.previous += 1;
+      });
+      document.querySelector("#play").addEventListener("click", () => {
+        controls.playPause += 1;
+      });
+      document.querySelector("#next").addEventListener("click", () => {
+        controls.next += 1;
+      });
+      window.YuraSubMockControls = controls;
+      let index = 0;
+      window.setInterval(() => {
+        index = (index + 1) % lines.length;
+        document.querySelector("#lyric").textContent = lines[index];
+      }, 1000);
+      window.setTimeout(() => {
+        document.querySelector("#status").textContent = JSON.stringify({
+          hasDebug: Boolean(window.YuraSubDebug),
+          status: window.YuraSubDebug ? window.YuraSubDebug.status() : null,
+          current: window.YuraSubDebug ? window.YuraSubDebug.current() : null,
+          inspect: window.YuraSubDebug ? window.YuraSubDebug.inspect() : null,
+          controls,
+          lyric: document.querySelector("#lyric").textContent,
+        }, null, 2);
+      }, 2500);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,23 @@
+[workspace]
+name = "yurasub"
+version = "0.1.0"
+description = "Windows-first transparent desktop subtitle overlay for browser audio players."
+authors = ["YuraSub Contributors"]
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[dependencies]
+python = ">=3.11,<3.13"
+pyside6 = ">=6.7"
+nuitka = ">=2.6"
+ordered-set = ">=4.1"
+zstandard = ">=0.22"
+
+[activation.env]
+PYTHONPATH = "src"
+
+[tasks]
+start = "python -m yurasub"
+dev = "python -m yurasub --debug"
+build = "python -m nuitka --standalone --onefile --enable-plugin=pyside6 --include-qt-plugins=platforms,styles,iconengines,imageformats --windows-console-mode=disable --output-dir=dist --output-filename=YuraSub.exe main.py"
+

@@ -12,8 +12,8 @@ assets/
 src/
   python/          Python 桌面端和本地服务代码
   dotnet/          预留 .NET Native AOT 代码
+  tampermonkey/    Tampermonkey 浏览器脚本
 tests/             Python 回归测试和本地 mock 页面
-userscript/        Tampermonkey 浏览器脚本
 ```
 
 根目录不保留 `main.py` 入口；运行、测试和打包统一通过 pixi task 执行。
@@ -31,7 +31,82 @@ ws://127.0.0.1:8765
 http://127.0.0.1:8766
 ```
 
-启动后只显示字幕层。字幕层顶部带一排内嵌控制按钮，默认可拖动/可缩放，锁定后会点击穿透；需要移动或调样式时，从托盘点“解锁拖动/显示控制”即可救回。
+启动后只显示字幕层。字幕层顶部带一排内嵌控制按钮，默认可拖动/可缩放，锁定后会点击穿透；需要移动或调样式时，从托盘点"解锁拖动/显示控制"即可救回。
+
+## 设置持久化
+
+程序退出时自动保存当前状态到 `config.json`，下次启动自动恢复。便携版不会写入注册表、`%APPDATA%` 或用户目录。
+
+保存的内容包括：
+
+- 窗口位置和尺寸
+- 锁定/点击穿透状态
+- 字体、正文字号、翻译字号
+- 正文颜色/透明度
+- 描边颜色/宽度/透明度
+- 图标/控件颜色（工具栏按钮、时间文本、进度条、拖拽角标）
+- WebSocket 端口、HTTP fallback 端口
+
+### 默认配置路径
+
+| 运行方式 | 配置文件位置 |
+|---------|------------|
+| `pixi run start`（开发模式） | 仓库根目录 `config.json` |
+| `YuraSub.exe`（打包后） | exe 同目录 `config.json` |
+
+开发模式下自动通过 `pixi.toml` 定位仓库根目录，不会写入 `.pixi/envs/`。
+
+### 配置优先级
+
+1. `--config path/to/settings.json`（最高）
+2. 环境变量 `YURASUB_CONFIG`
+3. 默认路径（见上表）
+
+### 配置文件示例
+
+```json
+{
+  "schemaVersion": 1,
+  "server": {
+    "websocketPort": 8765,
+    "httpPort": 8766
+  },
+  "window": {
+    "x": 200,
+    "y": 780,
+    "width": 1100,
+    "height": 180,
+    "clickThrough": false
+  },
+  "style": {
+    "fontFamily": "Microsoft YaHei UI",
+    "fontSize": 34,
+    "translationFontSize": 24,
+    "textColor": "#ffffff",
+    "textOpacity": 100,
+    "outlineColor": "#101522",
+    "outlineWidth": 4,
+    "outlineOpacity": 100,
+    "controlColor": "#f5fff8e6",
+    "controlOpacity": 90
+  }
+}
+```
+
+手动编辑 JSON 后，下次启动生效。也可以在托盘菜单中选择"恢复默认设置"。
+
+### 端口配置
+
+默认端口：WebSocket `8765`，HTTP fallback `8766`。修改方式（优先级从高到低）：
+
+1. **命令行参数**（最高优先级）：
+   ```powershell
+   pixi run start --port 9001 --http-port 9002
+   ```
+2. **配置文件**：编辑 `config.json` 中的 `server.websocketPort` 和 `server.httpPort`。
+3. **内置默认值**：`8765` / `8766`。
+
+浏览器 userscript 默认仍连接 `8765`，修改端口后需同步更新脚本中的 `CONFIG.endpoint` 和 `CONFIG.httpEndpoint`。
 
 浏览器脚本连接后会按脚本里的 `geometry`、`style` 提供初始配置。桌面端默认不让脚本覆盖本地锁定状态；你在字幕层顶部手动改过的锁定状态、位置尺寸、样式不会被下一条字幕刷新覆盖。
 
@@ -43,7 +118,7 @@ http://127.0.0.1:8766
 - 上一首 / 下一首：通过 WebSocket 回传给浏览器，优先点击页面播放器按钮，找不到按钮时尝试点击当前播放列表的相邻音频项，再回退到媒体按键事件。
 - 进度条：显示当前播放位置，右侧显示 `当前时间 / 总时间`；拖动后会发送 `seekTo` 跳转浏览器播放器。
 - 播放暂停：通过 WebSocket 回传给浏览器，按钮会根据浏览器回传的暂停状态在 `▶` / `Ⅱ` 间切换。
-- 样式按钮：展开一行透明内嵌样式面板，调整字体、正文字号、正文颜色、描边颜色、背景颜色；颜色透明度在取色框 alpha 通道里选。
+- 样式按钮：展开一行透明内嵌样式面板，调整字体、正文字号、正文颜色、描边颜色、图标颜色；颜色透明度在取色框 alpha 通道里选。图标颜色控制工具栏按钮、时间文本、进度条和拖拽角标的颜色，方便在浅色背景下保持可见。
 - `×`: 清空字幕。
 - 锁定：隐藏控制条并让字幕层点击穿透。
 
@@ -51,7 +126,7 @@ http://127.0.0.1:8766
 
 ## Tampermonkey
 
-安装 `userscript/yurasub.user.js`。脚本默认匹配 `https://www.asmr.one/`、`https://asmr.one/`、`https://kikoeru.moear.de/` 和本地 Kikoeru 地址，然后在脚本顶部修改 `CONFIG`：
+安装 `src/tampermonkey/yurasub.user.js`。脚本默认匹配 `https://www.asmr.one/`、`https://asmr.one/`、`https://kikoeru.moear.de/` 和本地 Kikoeru 地址，然后在脚本顶部修改 `CONFIG`：
 
 - `endpoint`: PySide6 端监听地址。
 - `httpEndpoint`: WebSocket 连不上时使用的 HTTP fallback 地址；脚本会 POST 字幕并轮询 GUI 发出的媒体命令。

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
+from pathlib import Path
 
+from .config import DEFAULT_CONFIG, load_config, resolve_config_path, save_config
 from .qt_bootstrap import prepare_qt_runtime
+
+logger = logging.getLogger(__name__)
 
 prepare_qt_runtime()
 
@@ -18,9 +23,10 @@ from .server import SubtitleHttpServer, SubtitleServer
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="YuraSub")
-    parser.add_argument("--host", default="127.0.0.1", help="WebSocket bind host.")
-    parser.add_argument("--port", type=int, default=8765, help="WebSocket bind port.")
-    parser.add_argument("--http-port", type=int, default=8766, help="HTTP fallback bind port.")
+    parser.add_argument("--config", default=None, help="Path to JSON config file.")
+    parser.add_argument("--host", default=None, help="WebSocket bind host.")
+    parser.add_argument("--port", type=int, default=None, help="WebSocket bind port.")
+    parser.add_argument("--http-port", type=int, default=None, help="HTTP fallback bind port.")
     parser.add_argument("--no-http", action="store_true", help="Disable HTTP fallback server.")
     parser.add_argument("--click-through", action="store_true", help="Start in click-through mode.")
     parser.add_argument("--debug", action="store_true", help="Print server events to stdout.")
@@ -30,15 +36,33 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # --- Load portable config ---------------------------------------------------
+    config_path = resolve_config_path(args.config)
+    config = load_config(config_path)
+
+    # CLI args override saved config (only when explicitly provided).
+    server_cfg = config.setdefault("server", {})
+    if args.host is not None:
+        server_cfg["host"] = args.host
+    if args.port is not None:
+        server_cfg["websocketPort"] = args.port
+    if args.http_port is not None:
+        server_cfg["httpPort"] = args.http_port
+
+    host = server_cfg.get("host", "127.0.0.1")
+    ws_port = int(server_cfg.get("websocketPort", 8765))
+    http_port = int(server_cfg.get("httpPort", 8766))
+
+    # --- Qt setup ---------------------------------------------------------------
     QCoreApplication.setApplicationName("YuraSub")
     QCoreApplication.setApplicationVersion(__version__)
     app = QApplication(sys.argv[:1])
     app.setQuitOnLastWindowClosed(False)
 
-    overlay = SubtitleOverlayWindow()
+    overlay = SubtitleOverlayWindow(config=config)
     overlay.show()
 
-    server = SubtitleServer(args.host, args.port)
+    server = SubtitleServer(host, ws_port)
     server.subtitle_received.connect(overlay.apply_payload)
     server.style_received.connect(overlay.apply_style)
     server.command_received.connect(overlay.apply_command)
@@ -48,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
 
     http_server = None
     if not args.no_http:
-        http_server = SubtitleHttpServer(args.host, args.http_port)
+        http_server = SubtitleHttpServer(host, http_port)
         http_server.subtitle_received.connect(overlay.apply_payload)
         http_server.style_received.connect(overlay.apply_style)
         http_server.command_received.connect(overlay.apply_command)
@@ -61,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         if http_server:
             http_server.log_message.connect(lambda message: print(message, flush=True))
 
-    tray = _create_tray(app, overlay, server)
+    tray = _create_tray(app, overlay, server, config_path)
 
     ws_started = server.start()
     http_started = http_server.start() if http_server else False
@@ -76,6 +100,13 @@ def main(argv: list[str] | None = None) -> int:
 
     tray.show()
     exit_code = app.exec()
+
+    # --- Save state on exit -----------------------------------------------------
+    try:
+        save_config(config_path, overlay.save_state())
+    except OSError as exc:
+        logger.warning("Failed to save config to %s: %s", config_path, exc)
+
     server.stop()
     if http_server:
         http_server.stop()
@@ -86,6 +117,7 @@ def _create_tray(
     app: QApplication,
     overlay: SubtitleOverlayWindow,
     server: SubtitleServer,
+    config_path: Path,
 ) -> QSystemTrayIcon:
     tray = QSystemTrayIcon(_make_icon(), app)
     tray.setToolTip(f"YuraSub {server.url}")
@@ -118,6 +150,16 @@ def _create_tray(
     show_action = QAction("显示窗口", menu)
     show_action.triggered.connect(lambda: (overlay.unlock_for_editing(), overlay.show(), overlay.raise_()))
 
+    def _restore_defaults() -> None:
+        overlay.reset_to_defaults()
+        try:
+            save_config(config_path, overlay.save_state())
+        except OSError as exc:
+            logger.warning("Failed to save default config: %s", exc)
+
+    restore_action = QAction("恢复默认设置", menu)
+    restore_action.triggered.connect(_restore_defaults)
+
     quit_action = QAction("退出", menu)
     quit_action.triggered.connect(lambda: app.quit())
 
@@ -125,6 +167,7 @@ def _create_tray(
     menu.addAction(lock_action)
     menu.addAction(clear_action)
     menu.addAction(show_action)
+    menu.addAction(restore_action)
     menu.addSeparator()
     menu.addAction(quit_action)
     tray.setContextMenu(menu)

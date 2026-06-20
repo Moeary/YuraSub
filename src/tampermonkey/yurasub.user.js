@@ -3,13 +3,13 @@
 // @namespace    https://github.com/yurasub/yurasub
 // @version      0.4.2
 // @description  Push current browser audio subtitles to the local YuraSub desktop overlay.
-// @author       YuraSub Contributors
+// @author       Moeary
 // @match        https://asmr.one/*
 // @match        https://www.asmr.one/*
 // @match        https://asmr-100.com/*
 // @match        https://asmr-200.com/*
 // @match        https://asmr-300.com/*
-// @match        https://kikoeru.moear.de/*
+// @match        https://kikoeru.*.*/*
 // @match        http://localhost:*/*
 // @match        http://127.0.0.1:*/*
 // @connect      127.0.0.1

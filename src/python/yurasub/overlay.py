@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .config import CONFIG_SCHEMA_VERSION, DEFAULT_CONFIG
 from .payload import clean_text, pick_text, read_bool
 
 
@@ -419,8 +420,9 @@ class SubtitleOverlayWindow(QWidget):
     media_command_requested = Signal(str)
     media_seek_requested = Signal(float)
 
-    def __init__(self) -> None:
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__()
+        self._config = config or {}
         self.canvas = SubtitleCanvas(self)
         self.controls = QWidget(self)
         self.toolbar = QWidget(self.controls)
@@ -439,6 +441,8 @@ class SubtitleOverlayWindow(QWidget):
         self._media_duration = 0.0
         self._media_position = 0.0
         self._media_paused = True
+        self._control_color = QColor(DEFAULT_CONFIG["style"]["controlColor"])
+        self._control_opacity = int(DEFAULT_CONFIG["style"]["controlOpacity"])
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
         self._status_timer.timeout.connect(self._clear_status)
@@ -453,10 +457,69 @@ class SubtitleOverlayWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
         self._build_controls()
-        self._sync_controls_from_style()
-        self.resize(1100, 180)
-        self._place_default()
+        self._restore_from_config()
         self._layout_children()
+
+    def _restore_from_config(self) -> None:
+        """Restore window geometry, style, and click-through from saved config."""
+        cfg = self._config
+
+        # Restore style first (before layout) so canvas knows the real style.
+        style_cfg = cfg.get("style")
+        if isinstance(style_cfg, dict):
+            # Merge with DEFAULT_STYLE to get all keys, then apply as local
+            # overrides so remote payloads won't clobber saved values.
+            merged = dict(DEFAULT_STYLE)
+            merged.update(style_cfg)
+            self.canvas.apply_style(merged, local=True)
+
+            # Restore control color (not part of canvas style).
+            cc = style_cfg.get("controlColor", DEFAULT_CONFIG["style"]["controlColor"])
+            co = style_cfg.get("controlOpacity", DEFAULT_CONFIG["style"]["controlOpacity"])
+            self._control_color = _color(cc, DEFAULT_CONFIG["style"]["controlColor"])
+            self._control_opacity = _as_int(co, int(DEFAULT_CONFIG["style"]["controlOpacity"]), 0, 100)
+            self._control_color.setAlpha(round(self._control_opacity * 255 / 100))
+            self._update_control_stylesheet()
+
+        self._sync_controls_from_style()
+
+        # Restore geometry.
+        win = cfg.get("window")
+        if isinstance(win, dict) and win.get("x") is not None and win.get("y") is not None:
+            width = _as_int(win.get("width"), 1100, 280, 3840)
+            height = _as_int(win.get("height"), 180, 80, 2160)
+            self.resize(width, height)
+            self.move(_as_int(win.get("x"), 200), _as_int(win.get("y"), 500))
+            self._local_geometry_override = True
+        else:
+            self.resize(1100, 180)
+            self._place_default()
+
+        # Restore click-through / lock state.
+        if isinstance(win, dict):
+            ct = read_bool(win.get("clickThrough"))
+            if ct:
+                self.set_click_through(True)
+
+    def save_state(self) -> dict[str, Any]:
+        """Return the current window state as a config-compatible dict."""
+        geo = self.geometry()
+        style = dict(self.canvas._style)
+        # Persist control color (not part of canvas rendering style).
+        style["controlColor"] = color_to_css(self._control_color)
+        style["controlOpacity"] = self._control_opacity
+        return {
+            "schemaVersion": CONFIG_SCHEMA_VERSION,
+            "server": dict(self._config.get("server", DEFAULT_CONFIG["server"])),
+            "window": {
+                "x": geo.x(),
+                "y": geo.y(),
+                "width": geo.width(),
+                "height": geo.height(),
+                "clickThrough": self._click_through,
+            },
+            "style": style,
+        }
 
     @property
     def click_through(self) -> bool:
@@ -474,59 +537,7 @@ class SubtitleOverlayWindow(QWidget):
         self.controls.setObjectName("overlayControls")
         self.toolbar.setObjectName("overlayToolbar")
         self.style_panel.setObjectName("overlayStylePanel")
-        self.controls.setStyleSheet(
-            """
-            QWidget#overlayToolbar {
-                background: rgba(12, 18, 20, 0);
-                border: 1px solid rgba(229, 241, 232, 18);
-                border-radius: 12px;
-            }
-            QWidget#overlayStylePanel {
-                background: rgba(12, 18, 20, 30);
-                border: 1px solid rgba(229, 241, 232, 34);
-                border-radius: 12px;
-            }
-            QToolButton {
-                color: rgba(245, 255, 248, 230);
-                background: transparent;
-                font-size: 22px;
-                font-weight: 700;
-                border: none;
-                padding: 3px 8px;
-            }
-            QToolButton:hover {
-                background: rgba(221, 245, 225, 34);
-                border-radius: 8px;
-            }
-            QLabel {
-                color: rgba(245, 255, 248, 224);
-                font-size: 12px;
-            }
-            QSpinBox, QFontComboBox {
-                background: rgba(245, 255, 248, 168);
-                color: #111827;
-                border: 1px solid rgba(255, 255, 255, 74);
-                border-radius: 6px;
-                padding: 2px 6px;
-            }
-            QSlider::groove:horizontal {
-                height: 4px;
-                border-radius: 2px;
-                background: rgba(245, 255, 248, 54);
-            }
-            QSlider::sub-page:horizontal {
-                height: 4px;
-                border-radius: 2px;
-                background: rgba(125, 211, 252, 190);
-            }
-            QSlider::handle:horizontal {
-                width: 12px;
-                margin: -5px 0;
-                border-radius: 6px;
-                background: rgba(245, 255, 248, 224);
-            }
-            """
-        )
+        self._update_control_stylesheet()
 
         root = QVBoxLayout(self.controls)
         root.setContentsMargins(0, 0, 0, 0)
@@ -583,7 +594,7 @@ class SubtitleOverlayWindow(QWidget):
         self.font_size_spin = _spin(12, 120, int(DEFAULT_STYLE["fontSize"]))
         self.text_color_button = ColorToolButton("正文颜色", _color(DEFAULT_STYLE["textColor"], "#ffffff"))
         self.outline_color_button = ColorToolButton("描边", _color(DEFAULT_STYLE["outlineColor"], "#101522"))
-        self.background_color_button = ColorToolButton("背景颜色", _color(DEFAULT_STYLE["backgroundColor"], "#00000000"))
+        self.control_color_button = ColorToolButton("图标颜色", _color(DEFAULT_CONFIG["style"]["controlColor"], "#f5fff8e6"))
 
         panel_layout.addWidget(QLabel("字体"), 0, 0)
         panel_layout.addWidget(self.font_combo, 0, 1)
@@ -591,7 +602,7 @@ class SubtitleOverlayWindow(QWidget):
         panel_layout.addWidget(self.font_size_spin, 0, 3)
         panel_layout.addWidget(self.text_color_button, 0, 4)
         panel_layout.addWidget(self.outline_color_button, 0, 5)
-        panel_layout.addWidget(self.background_color_button, 0, 6)
+        panel_layout.addWidget(self.control_color_button, 0, 6)
         panel_layout.setColumnStretch(1, 1)
 
         root.addWidget(self.style_panel)
@@ -612,9 +623,7 @@ class SubtitleOverlayWindow(QWidget):
         self.font_size_spin.valueChanged.connect(lambda value: self._apply_control_style({"fontSize": value}))
         self.text_color_button.color_changed.connect(lambda color: self._apply_control_style({"textColor": color_to_css(color)}))
         self.outline_color_button.color_changed.connect(lambda color: self._apply_control_style({"outlineColor": color_to_css(color)}))
-        self.background_color_button.color_changed.connect(
-            lambda color: self._apply_control_style({"backgroundColor": color_to_css(color), "backgroundOpacity": 100})
-        )
+        self.control_color_button.color_changed.connect(self._apply_control_color)
 
     def toggle_style_panel(self) -> None:
         self.style_panel.setVisible(self.style_panel.isHidden())
@@ -637,6 +646,73 @@ class SubtitleOverlayWindow(QWidget):
             return
         self.apply_local_style(style)
 
+    def _apply_control_color(self, color: QColor) -> None:
+        """Apply a new control/icon color and persist it."""
+        if self._syncing_controls:
+            return
+        self._control_color = QColor(color)
+        self._control_opacity = round(color.alpha() * 100 / 255)
+        self._update_control_stylesheet()
+        self.update()  # repaint grip
+        self.style_changed.emit(self.style)
+
+    def _update_control_stylesheet(self) -> None:
+        """Rebuild the controls stylesheet using the current control color."""
+        c = self._control_color
+        alpha = max(c.alpha(), 72)
+        css = f"""
+            QWidget#overlayToolbar {{
+                background: rgba(12, 18, 20, 0);
+                border: 1px solid rgba(229, 241, 232, 18);
+                border-radius: 12px;
+            }}
+            QWidget#overlayStylePanel {{
+                background: rgba(12, 18, 20, 30);
+                border: 1px solid rgba(229, 241, 232, 34);
+                border-radius: 12px;
+            }}
+            QToolButton {{
+                color: rgba({c.red()}, {c.green()}, {c.blue()}, {alpha});
+                background: transparent;
+                font-size: 22px;
+                font-weight: 700;
+                border: none;
+                padding: 3px 8px;
+            }}
+            QToolButton:hover {{
+                background: rgba({c.red()}, {c.green()}, {c.blue()}, 34);
+                border-radius: 8px;
+            }}
+            QLabel {{
+                color: rgba({c.red()}, {c.green()}, {c.blue()}, {max(c.alpha() - 6, 0)});
+                font-size: 12px;
+            }}
+            QSpinBox, QFontComboBox {{
+                background: rgba(245, 255, 248, 168);
+                color: #111827;
+                border: 1px solid rgba(255, 255, 255, 74);
+                border-radius: 6px;
+                padding: 2px 6px;
+            }}
+            QSlider::groove:horizontal {{
+                height: 4px;
+                border-radius: 2px;
+                background: rgba(245, 255, 248, 54);
+            }}
+            QSlider::sub-page:horizontal {{
+                height: 4px;
+                border-radius: 2px;
+                background: rgba({c.red()}, {c.green()}, {c.blue()}, {max(c.alpha() - 40, 60)});
+            }}
+            QSlider::handle:horizontal {{
+                width: 12px;
+                margin: -5px 0;
+                border-radius: 6px;
+                background: rgba({c.red()}, {c.green()}, {c.blue()}, {max(c.alpha() - 6, 0)});
+            }}
+        """
+        self.controls.setStyleSheet(css)
+
     def _sync_controls_from_style(self) -> None:
         if not hasattr(self, "font_combo"):
             return
@@ -646,7 +722,8 @@ class SubtitleOverlayWindow(QWidget):
         self.font_size_spin.setValue(_as_int(style.get("fontSize"), DEFAULT_STYLE["fontSize"], 12, 120))
         self.text_color_button.set_color(_color(style.get("textColor"), DEFAULT_STYLE["textColor"]))
         self.outline_color_button.set_color(_color(style.get("outlineColor"), DEFAULT_STYLE["outlineColor"]))
-        self.background_color_button.set_color(_color(style.get("backgroundColor"), DEFAULT_STYLE["backgroundColor"]))
+        # Control color comes from the overlay field, not from canvas style.
+        self.control_color_button.set_color(self._control_color)
         self._syncing_controls = False
 
     def apply_payload(self, payload: dict[str, Any]) -> None:
@@ -692,6 +769,32 @@ class SubtitleOverlayWindow(QWidget):
 
     def clear_local_style_overrides(self) -> None:
         self.canvas.clear_local_overrides()
+        self.style_changed.emit(self.style)
+
+    def reset_to_defaults(self) -> None:
+        """Reset all style, control color, geometry, and server config to built-in defaults."""
+        # Reset stored config so save_state() writes default ports.
+        self._config = {}
+
+        # Reset canvas style to defaults and mark all as local overrides.
+        self.canvas._style = dict(DEFAULT_STYLE)
+        self.canvas._local_override_keys = set(DEFAULT_STYLE.keys())
+        self.canvas.update()
+
+        # Reset control color.
+        self._control_color = QColor(DEFAULT_CONFIG["style"]["controlColor"])
+        self._control_opacity = int(DEFAULT_CONFIG["style"]["controlOpacity"])
+        self._update_control_stylesheet()
+
+        # Reset geometry.
+        self._local_geometry_override = False
+        self.resize(1100, 180)
+        self._place_default()
+
+        # Reset lock / click-through.
+        self.unlock_for_editing()
+
+        self._sync_controls_from_style()
         self.style_changed.emit(self.style)
 
     def apply_command(self, command: dict[str, Any]) -> None:
@@ -829,7 +932,9 @@ class SubtitleOverlayWindow(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -2, -2), 10, 10)
         grip = QRectF(self.width() - 24, self.height() - 24, 16, 16)
-        painter.setPen(QPen(QColor(255, 255, 255, 130), 2))
+        cc = QColor(self._control_color)
+        cc.setAlpha(max(cc.alpha() - 6, 0))
+        painter.setPen(QPen(cc, 2))
         painter.drawLine(grip.left(), grip.bottom(), grip.right(), grip.top())
         painter.drawLine(grip.left() + 6, grip.bottom(), grip.right(), grip.top() + 6)
 

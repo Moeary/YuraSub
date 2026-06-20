@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -12,11 +11,9 @@ from yurasub.config import (
     CONFIG_SCHEMA_VERSION,
     DEFAULT_CONFIG,
     DEFAULT_CONFIG_FILENAME,
-    LEGACY_CONFIG_FILENAME,
     _deep_merge,
     _default_dir,
     _find_repo_root,
-    _migrate_legacy_config,
     load_config,
     resolve_config_path,
     save_config,
@@ -40,8 +37,12 @@ def test_default_ports():
     assert DEFAULT_CONFIG["server"]["httpPort"] == 8766
 
 
+def test_default_window_includes_locked():
+    assert DEFAULT_CONFIG["window"]["locked"] is False
+    assert DEFAULT_CONFIG["window"]["clickThrough"] is False
+
+
 def test_default_style_matches_overlay():
-    """Config defaults should match the overlay's DEFAULT_STYLE."""
     style = DEFAULT_CONFIG["style"]
     assert style["fontFamily"] == "Microsoft YaHei UI"
     assert style["fontSize"] == 34
@@ -64,10 +65,6 @@ def test_schema_version_is_int():
 
 def test_default_filename_is_config_json():
     assert DEFAULT_CONFIG_FILENAME == "config.json"
-
-
-def test_legacy_filename_preserved():
-    assert LEGACY_CONFIG_FILENAME == "YuraSub.config.json"
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +117,6 @@ def test_load_config_empty_file_returns_defaults(tmp_path: Path):
 
 
 def test_load_config_legacy_background_color_not_lost(tmp_path: Path):
-    """Old config with backgroundColor should load without error."""
     cfg = tmp_path / "config.json"
     cfg.write_text(
         json.dumps({"style": {"backgroundColor": "#ff000080", "backgroundOpacity": 50}}),
@@ -139,47 +135,11 @@ def test_load_config_control_color(tmp_path: Path):
     assert result["style"]["controlColor"] == "#aabbccdd"
 
 
-# ---------------------------------------------------------------------------
-# Legacy migration (YuraSub.config.json → config.json)
-# ---------------------------------------------------------------------------
-
-
-def test_migrate_legacy_creates_new_and_deletes_old(tmp_path: Path):
-    legacy = tmp_path / LEGACY_CONFIG_FILENAME
-    target = tmp_path / DEFAULT_CONFIG_FILENAME
-    legacy.write_text(json.dumps({"server": {"websocketPort": 1111}}), encoding="utf-8")
-    data = _migrate_legacy_config(target)
-    assert data is not None
-    assert data["server"]["websocketPort"] == 1111
-    assert target.exists()
-    assert not legacy.exists()
-
-
-def test_migrate_legacy_skipped_when_target_exists(tmp_path: Path):
-    legacy = tmp_path / LEGACY_CONFIG_FILENAME
-    target = tmp_path / DEFAULT_CONFIG_FILENAME
-    target.write_text("{}", encoding="utf-8")
-    legacy.write_text('{"server":{"websocketPort":9999}}', encoding="utf-8")
-    data = _migrate_legacy_config(target)
-    assert data is None
-    assert legacy.exists()  # not deleted
-
-
-def test_migrate_legacy_skipped_when_no_legacy(tmp_path: Path):
-    target = tmp_path / DEFAULT_CONFIG_FILENAME
-    data = _migrate_legacy_config(target)
-    assert data is None
-
-
-def test_load_config_transparently_migrates_legacy(tmp_path: Path):
-    """load_config should read from legacy file transparently."""
-    legacy = tmp_path / LEGACY_CONFIG_FILENAME
-    target = tmp_path / DEFAULT_CONFIG_FILENAME
-    legacy.write_text(json.dumps({"server": {"httpPort": 7777}}), encoding="utf-8")
-    result = load_config(target)
-    assert result["server"]["httpPort"] == 7777
-    assert target.exists()
-    assert not legacy.exists()
+def test_load_config_locked_field(tmp_path: Path):
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"window": {"locked": True}}), encoding="utf-8")
+    result = load_config(cfg)
+    assert result["window"]["locked"] is True
 
 
 # ---------------------------------------------------------------------------

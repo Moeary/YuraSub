@@ -495,11 +495,15 @@ class SubtitleOverlayWindow(QWidget):
             self.resize(1100, 180)
             self._place_default()
 
-        # Restore click-through / lock state.
+        # Restore lock / click-through state.
         if isinstance(win, dict):
-            ct = read_bool(win.get("clickThrough"))
-            if ct:
-                self.set_click_through(True)
+            locked = read_bool(win.get("locked"))
+            if locked:
+                self.set_locked(True)
+            else:
+                ct = read_bool(win.get("clickThrough"))
+                if ct:
+                    self.set_click_through(True)
 
     def save_state(self) -> dict[str, Any]:
         """Return the current window state as a config-compatible dict."""
@@ -517,6 +521,7 @@ class SubtitleOverlayWindow(QWidget):
                 "width": geo.width(),
                 "height": geo.height(),
                 "clickThrough": self._click_through,
+                "locked": self._locked,
             },
             "style": style,
         }

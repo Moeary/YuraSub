@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 CONFIG_SCHEMA_VERSION = 1
 DEFAULT_CONFIG_FILENAME = "config.json"
-LEGACY_CONFIG_FILENAME = "YuraSub.config.json"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "schemaVersion": CONFIG_SCHEMA_VERSION,
@@ -40,6 +39,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "width": 1100,
         "height": 180,
         "clickThrough": False,
+        "locked": False,
     },
     "style": {
         "fontFamily": "Microsoft YaHei UI",
@@ -103,7 +103,7 @@ def resolve_config_path(override: str | None = None) -> Path:
     Priority:
       1. *override* (from ``--config``)
       2. ``YURASUB_CONFIG`` environment variable
-      3. Default directory + ``YuraSub.config.json``
+      3. Default directory + ``config.json``
     """
     if override:
         return Path(override).resolve()
@@ -128,41 +128,6 @@ def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, An
     return merged
 
 
-def _migrate_legacy_config(target: Path) -> dict[str, Any] | None:
-    """If *target* doesn't exist but the legacy file does, migrate it.
-
-    Reads the legacy ``YuraSub.config.json`` from the same directory,
-    saves it as ``config.json``, and deletes the legacy file.
-    Returns the loaded config dict, or ``None`` if no migration needed.
-    """
-    if target.exists():
-        return None
-    legacy = target.parent / LEGACY_CONFIG_FILENAME
-    if not legacy.exists():
-        return None
-    try:
-        text = legacy.read_text(encoding="utf-8")
-        data = json.loads(text)
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Failed to read legacy config %s: %s", legacy, exc)
-        return None
-    if not isinstance(data, dict):
-        return None
-    # Save to new location.
-    try:
-        save_config(target, data)
-    except OSError as exc:
-        logger.warning("Failed to migrate config to %s: %s", target, exc)
-        return data
-    # Delete legacy file.
-    try:
-        legacy.unlink()
-        logger.info("Migrated %s -> %s", legacy.name, target.name)
-    except OSError:
-        pass
-    return data
-
-
 def load_config(path: Path) -> dict[str, Any]:
     """Load config from *path*, filling missing keys from defaults.
 
@@ -170,23 +135,18 @@ def load_config(path: Path) -> dict[str, Any]:
     If the file is missing or malformed, returns defaults unchanged.
     Unknown keys (e.g. legacy ``backgroundColor``) are preserved but
     do not cause errors.
-
-    Transparently migrates ``YuraSub.config.json`` → ``config.json``
-    if the new file doesn't exist yet.
     """
-    data = _migrate_legacy_config(path)
-    if data is None:
-        if not path.exists():
-            return _deep_merge(DEFAULT_CONFIG, {})
-        try:
-            text = path.read_text(encoding="utf-8")
-            data = json.loads(text)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to read config %s: %s — using defaults", path, exc)
-            return _deep_merge(DEFAULT_CONFIG, {})
-        if not isinstance(data, dict):
-            logger.warning("Config %s is not a JSON object — using defaults", path)
-            return _deep_merge(DEFAULT_CONFIG, {})
+    if not path.exists():
+        return _deep_merge(DEFAULT_CONFIG, {})
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = json.loads(text)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to read config %s: %s — using defaults", path, exc)
+        return _deep_merge(DEFAULT_CONFIG, {})
+    if not isinstance(data, dict):
+        logger.warning("Config %s is not a JSON object — using defaults", path)
+        return _deep_merge(DEFAULT_CONFIG, {})
     return _deep_merge(DEFAULT_CONFIG, data)
 
 

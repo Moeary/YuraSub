@@ -2,6 +2,22 @@
 
 YuraSub 是一个 Windows 优先的本地透明桌面字幕浮层。浏览器端 Tampermonkey 脚本从 asmr.one / Kikoeru 页面读取当前字幕，并通过本机 WebSocket 推送给 PySide6 桌面窗口。
 
+## 仓库结构
+
+```text
+assets/
+  player-html/     收集到的网站播放器 HTML 快照
+  docs/            推荐档案建设相关资料
+  readme-images/   README 使用的图片
+src/
+  python/          Python 桌面端和本地服务代码
+  dotnet/          预留 .NET Native AOT 代码
+tests/             Python 回归测试和本地 mock 页面
+userscript/        Tampermonkey 浏览器脚本
+```
+
+根目录不保留 `main.py` 入口；运行、测试和打包统一通过 pixi task 执行。
+
 ## 运行
 
 ```powershell
@@ -100,7 +116,15 @@ window.YuraSubDebug.push()
 pixi run build
 ```
 
-输出文件在 `dist/YuraSub.exe`。构建任务使用 Nuitka onefile 和 PySide6 插件，不包含额外 GUI 配置界面。
+输出文件在 `dist/YuraSub.exe`。构建任务使用 Nuitka onefile 和 PySide6 插件，从 `src/python` 下的 `yurasub.__main__` 入口打包，不包含额外 GUI 配置界面。
+
+## 测试
+
+```powershell
+pixi run test
+```
+
+测试任务使用 pixi 环境内的 pytest。
 
 ## 回归测试页
 

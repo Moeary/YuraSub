@@ -11,13 +11,15 @@ python = ">=3.11,<3.13"
 pyside6 = ">=6.7"
 nuitka = ">=2.6"
 ordered-set = ">=4.1"
+pytest = ">=8.4"
 zstandard = ">=0.22"
 
 [activation.env]
-PYTHONPATH = "src"
+PYTHONPATH = "src/python"
 
 [tasks]
 start = "python -m yurasub"
 dev = "python -m yurasub --debug"
-build = "python -m nuitka --standalone --onefile --enable-plugin=pyside6 --include-qt-plugins=platforms,styles,iconengines,imageformats --windows-console-mode=disable --output-dir=dist --output-filename=YuraSub.exe main.py"
+build = "python -m nuitka --standalone --onefile --enable-plugin=pyside6 --include-qt-plugins=platforms,styles,iconengines,imageformats --windows-console-mode=disable --output-dir=dist --output-filename=YuraSub.exe -m yurasub"
+test = "python -m pytest"
 

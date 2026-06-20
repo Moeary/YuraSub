@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 *.pyd
 *.pyo
 dist/
@@ -10,4 +11,5 @@ build/
 *.dist/
 *.onefile-build/
 .nuitka/
+
 

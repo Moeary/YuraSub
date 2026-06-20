@@ -20,6 +20,6 @@ PYTHONPATH = "src/python"
 [tasks]
 start = "python -m yurasub"
 dev = "python -m yurasub --debug"
-build = "python -m nuitka --standalone --onefile --enable-plugin=pyside6 --include-qt-plugins=platforms,styles,iconengines,imageformats --windows-console-mode=disable --output-dir=dist --output-filename=YuraSub.exe -m yurasub"
+build = "python -m nuitka --standalone --onefile --enable-plugin=pyside6 --include-qt-plugins=platforms,styles,iconengines,imageformats --windows-console-mode=disable --output-dir=dist --output-filename=YuraSub.exe --python-flag=-m src/python/yurasub"
 test = "python -m pytest"
 

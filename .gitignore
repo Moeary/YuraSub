@@ -1,8 +1,10 @@
+__pycache__/
+
 .pixi/
 .venv/
 .nuitka/
 .pytest_cache/
-__pycache__/
+
 *.py[cod]
 *.pyd
 *.pyo
@@ -10,8 +12,8 @@ __pycache__/
 *.dist/
 *.onefile-build/
 
-dist/
 build/
+dist/
 
+agents.md
 config.json
-

@@ -15,5 +15,9 @@ __pycache__/
 build/
 dist/
 
+# .NET build artifacts
+obj/
+bin/
+
 agents.md
 config.json

@@ -143,12 +143,11 @@ def _global_pos(event: Any) -> QPoint:
 
 
 class ColorToolButton(QPushButton):
-    color_changed = Signal(QColor)
-
     def __init__(self, label: str, color: QColor, parent: QWidget | None = None) -> None:
         super().__init__(label, parent)
         self._color = QColor(color)
-        self.clicked.connect(self._choose_color)
+        self._color_changed_callback: Any = None
+        self.clicked.connect(lambda: self._choose_color())
         self._sync_style()
 
     @property
@@ -161,11 +160,15 @@ class ColorToolButton(QPushButton):
         self._color = QColor(color)
         self._sync_style()
 
+    def set_color_changed_callback(self, callback: Any) -> None:
+        self._color_changed_callback = callback
+
     def _choose_color(self) -> None:
         selected = QColorDialog.getColor(self._color, self, self.text(), QColorDialog.ColorDialogOption.ShowAlphaChannel)
         if selected.isValid():
             self.set_color(selected)
-            self.color_changed.emit(QColor(self._color))
+            if callable(self._color_changed_callback):
+                self._color_changed_callback(QColor(self._color))
 
     def _sync_style(self) -> None:
         text_color = "#111827" if self._color.lightness() > 145 and self._color.alpha() > 80 else "#ffffff"
@@ -182,13 +185,15 @@ class ColorToolButton(QPushButton):
 
 
 class SeekSlider(QSlider):
-    seek_released = Signal()
-
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(Qt.Orientation.Horizontal, parent)
+        self._seek_released_callback: Any = None
         self.setRange(0, 1000)
         self.setPageStep(0)
         self.setSingleStep(1)
+
+    def set_seek_released_callback(self, callback: Any) -> None:
+        self._seek_released_callback = callback
 
     def mousePressEvent(self, event: Any) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -209,7 +214,8 @@ class SeekSlider(QSlider):
         if event.button() == Qt.MouseButton.LeftButton and self.isSliderDown():
             self._set_value_from_position(event.position().x())
             self.setSliderDown(False)
-            self.seek_released.emit()
+            if callable(self._seek_released_callback):
+                self._seek_released_callback()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -445,7 +451,7 @@ class SubtitleOverlayWindow(QWidget):
         self._control_opacity = int(DEFAULT_CONFIG["style"]["controlOpacity"])
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
-        self._status_timer.timeout.connect(self._clear_status)
+        self._status_timer.timeout.connect(lambda: self._clear_status())
 
         self.setWindowTitle("YuraSub")
         self.setWindowFlags(
@@ -619,16 +625,16 @@ class SubtitleOverlayWindow(QWidget):
         self.play_pause_button.clicked.connect(lambda: self.media_command_requested.emit("playPause"))
         self.next_button.clicked.connect(lambda: self.media_command_requested.emit("nextTrack"))
         self.progress_slider.valueChanged.connect(lambda _value: self._update_progress_time_from_slider())
-        self.progress_slider.seek_released.connect(self._seek_from_progress_slider)
-        self.palette_button.clicked.connect(self.toggle_style_panel)
-        self.clear_button.clicked.connect(self.clear_subtitle)
+        self.progress_slider.set_seek_released_callback(self._seek_from_progress_slider)
+        self.palette_button.clicked.connect(lambda: self.toggle_style_panel())
+        self.clear_button.clicked.connect(lambda: self.clear_subtitle())
         self.lock_button.clicked.connect(lambda: self.set_locked(True, local=True))
 
         self.font_combo.currentFontChanged.connect(lambda font: self._apply_control_style({"fontFamily": font.family()}))
         self.font_size_spin.valueChanged.connect(lambda value: self._apply_control_style({"fontSize": value}))
-        self.text_color_button.color_changed.connect(lambda color: self._apply_control_style({"textColor": color_to_css(color)}))
-        self.outline_color_button.color_changed.connect(lambda color: self._apply_control_style({"outlineColor": color_to_css(color)}))
-        self.control_color_button.color_changed.connect(self._apply_control_color)
+        self.text_color_button.set_color_changed_callback(lambda color: self._apply_control_style({"textColor": color_to_css(color)}))
+        self.outline_color_button.set_color_changed_callback(lambda color: self._apply_control_style({"outlineColor": color_to_css(color)}))
+        self.control_color_button.set_color_changed_callback(lambda color: self._apply_control_color(color))
 
     def toggle_style_panel(self) -> None:
         self.style_panel.setVisible(self.style_panel.isHidden())

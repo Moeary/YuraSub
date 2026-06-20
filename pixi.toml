@@ -23,3 +23,10 @@ dev = "python -m yurasub --debug"
 build = "python -m nuitka --standalone --onefile --enable-plugin=pyside6 --include-qt-plugins=platforms,styles,iconengines,imageformats --windows-console-mode=disable --output-dir=dist --output-filename=YuraSub.exe --python-flag=-m src/python/yurasub"
 test = "python -m pytest"
 
+# .NET Native AOT tasks
+dotnet-restore = "dotnet restore src/dotnet/YuraSub.Native/YuraSub.Native.csproj"
+dotnet-build = "dotnet build src/dotnet/YuraSub.Native/YuraSub.Native.csproj -c Release"
+dotnet-test = "dotnet test src/dotnet/YuraSub.Native.Tests/YuraSub.Native.Tests.csproj --verbosity normal"
+dotnet-publish = "cmd /c \"set PATH=%PATH%;C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer&& dotnet publish src/dotnet/YuraSub.Native/YuraSub.Native.csproj -c Release -r win-x64 -p:PublishAot=true -p:SelfContained=true\""
+start-dotnet = "dist\\YuraSub.Native.exe"
+

@@ -63,22 +63,22 @@ def main(argv: list[str] | None = None) -> int:
     overlay.show()
 
     server = SubtitleServer(host, ws_port)
-    server.subtitle_received.connect(overlay.apply_payload)
-    server.style_received.connect(overlay.apply_style)
-    server.command_received.connect(overlay.apply_command)
-    server.clear_requested.connect(overlay.clear_subtitle)
-    overlay.media_command_requested.connect(server.broadcast_media_command)
-    overlay.media_seek_requested.connect(server.broadcast_media_seek)
+    server.subtitle_received.connect(lambda payload: overlay.apply_payload(payload))
+    server.style_received.connect(lambda style: overlay.apply_style(style))
+    server.command_received.connect(lambda command: overlay.apply_command(command))
+    server.clear_requested.connect(lambda: overlay.clear_subtitle())
+    overlay.media_command_requested.connect(lambda command: server.broadcast_media_command(command))
+    overlay.media_seek_requested.connect(lambda seconds: server.broadcast_media_seek(seconds))
 
     http_server = None
     if not args.no_http:
         http_server = SubtitleHttpServer(host, http_port)
-        http_server.subtitle_received.connect(overlay.apply_payload)
-        http_server.style_received.connect(overlay.apply_style)
-        http_server.command_received.connect(overlay.apply_command)
-        http_server.clear_requested.connect(overlay.clear_subtitle)
-        overlay.media_command_requested.connect(http_server.broadcast_media_command)
-        overlay.media_seek_requested.connect(http_server.broadcast_media_seek)
+        http_server.subtitle_received.connect(lambda payload: overlay.apply_payload(payload))
+        http_server.style_received.connect(lambda style: overlay.apply_style(style))
+        http_server.command_received.connect(lambda command: overlay.apply_command(command))
+        http_server.clear_requested.connect(lambda: overlay.clear_subtitle())
+        overlay.media_command_requested.connect(lambda command: http_server.broadcast_media_command(command))
+        overlay.media_seek_requested.connect(lambda seconds: http_server.broadcast_media_seek(seconds))
 
     if args.debug:
         server.log_message.connect(lambda message: print(message, flush=True))
@@ -138,8 +138,8 @@ def _create_tray(
         interactive_action.setChecked(not click_through)
         interactive_action.blockSignals(False)
 
-    interactive_action.toggled.connect(set_interactive)
-    overlay.click_through_changed.connect(sync_interactive)
+    interactive_action.toggled.connect(lambda enabled: set_interactive(enabled))
+    overlay.click_through_changed.connect(lambda click_through: sync_interactive(click_through))
 
     clear_action = QAction("清空字幕", menu)
     clear_action.triggered.connect(lambda: overlay.clear_subtitle())
@@ -158,7 +158,7 @@ def _create_tray(
             logger.warning("Failed to save default config: %s", exc)
 
     restore_action = QAction("恢复默认设置", menu)
-    restore_action.triggered.connect(_restore_defaults)
+    restore_action.triggered.connect(lambda: _restore_defaults())
 
     quit_action = QAction("退出", menu)
     quit_action.triggered.connect(lambda: app.quit())
@@ -175,7 +175,7 @@ def _create_tray(
     def update_tooltip(count: int) -> None:
         tray.setToolTip(f"YuraSub {server.url} | clients: {count}")
 
-    server.client_count_changed.connect(update_tooltip)
+    server.client_count_changed.connect(lambda count: update_tooltip(count))
     tray.activated.connect(
         lambda reason: (
             overlay.unlock_for_editing(),

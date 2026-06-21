@@ -1,3 +1,4 @@
+using System;
 using System.IO;
 using YuraSub.Native;
 using YuraSub.Native.Json;
@@ -47,6 +48,8 @@ public class ConfigTests
         Assert.Equal(100, Config.GetInt(config, "style", "outlineOpacity", 0));
         Assert.Equal("#f5fff8e6", Config.GetString(config, "style", "controlColor", ""));
         Assert.Equal(90, Config.GetInt(config, "style", "controlOpacity", 0));
+        Assert.Equal("#0c121e00", Config.GetString(config, "style", "controlBackgroundColor", ""));
+        Assert.Equal(0, Config.GetInt(config, "style", "controlBackgroundOpacity", -1));
         Assert.Equal("#00000000", Config.GetString(config, "style", "backgroundColor", ""));
         Assert.Equal(0, Config.GetInt(config, "style", "backgroundOpacity", 0));
     }
@@ -129,6 +132,22 @@ public class ConfigTests
         finally
         {
             File.Delete(tmpFile);
+        }
+    }
+
+    [Fact]
+    public void ResolvePath_DefaultUsesExecutableDirectory()
+    {
+        string? oldEnv = Environment.GetEnvironmentVariable("YURASUB_CONFIG");
+        try
+        {
+            Environment.SetEnvironmentVariable("YURASUB_CONFIG", null);
+            string expected = Path.Combine(AppContext.BaseDirectory, Config.DefaultFilename);
+            Assert.Equal(Path.GetFullPath(expected), Config.ResolvePath(null));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("YURASUB_CONFIG", oldEnv);
         }
     }
 }

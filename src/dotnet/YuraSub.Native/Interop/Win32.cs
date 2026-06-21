@@ -70,6 +70,10 @@ internal static class Win32
     public const int NIF_TIP = 0x00000004;
     public const int NIF_INFO = 0x00000010;
 
+    // --- Popup menu flags ---
+    public const uint TPM_RIGHTBUTTON = 0x0002;
+    public const uint TPM_RETURNCMD = 0x0100;
+
     // --- Tray activation ---
     public const int WM_LBUTTONUP_TRAY = 0x0202;
     public const int WM_RBUTTONUP_TRAY = 0x0205;
@@ -275,7 +279,7 @@ internal static class Win32
     public static extern bool AppendMenuW(IntPtr hMenu, uint uFlags, IntPtr uIDNewItem, string lpNewItem);
 
     [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool TrackPopupMenu(IntPtr hMenu, uint uFlags, int x, int y, int nReserved, IntPtr hWnd, IntPtr prcRect);
+    public static extern int TrackPopupMenu(IntPtr hMenu, uint uFlags, int x, int y, int nReserved, IntPtr hWnd, IntPtr prcRect);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool DestroyMenu(IntPtr hMenu);
@@ -291,6 +295,9 @@ internal static class Win32
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool InvalidateRect(IntPtr hWnd, IntPtr lpRect, bool bErase);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UpdateWindow(IntPtr hWnd);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool ValidateRect(IntPtr hWnd, IntPtr lpRect);

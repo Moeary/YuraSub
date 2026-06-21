@@ -7,7 +7,7 @@ using YuraSub.Native.Json;
 namespace YuraSub.Native;
 
 /// <summary>
-/// Portable JSON configuration for YuraSub — mirrors the Python config module.
+/// Portable JSON configuration for YuraSub — mirrors the Python frozen/exe config mode.
 /// </summary>
 internal static class Config
 {
@@ -37,6 +37,8 @@ internal static class Config
         public const int OutlineOpacity = 100;
         public const string ControlColor = "#f5fff8e6";
         public const int ControlOpacity = 90;
+        public const string ControlBackgroundColor = "#0c121e00";
+        public const int ControlBackgroundOpacity = 0;
         public const string BackgroundColor = "#00000000";
         public const int BackgroundOpacity = 0;
     }
@@ -86,6 +88,8 @@ internal static class Config
             ["outlineOpacity"] = Defaults.OutlineOpacity,
             ["controlColor"] = Defaults.ControlColor,
             ["controlOpacity"] = Defaults.ControlOpacity,
+            ["controlBackgroundColor"] = Defaults.ControlBackgroundColor,
+            ["controlBackgroundOpacity"] = Defaults.ControlBackgroundOpacity,
             ["backgroundColor"] = Defaults.BackgroundColor,
             ["backgroundOpacity"] = Defaults.BackgroundOpacity,
         };
@@ -159,15 +163,6 @@ internal static class Config
 
     private static string FindDefaultDir()
     {
-        // Try to find repo root by looking for pixi.toml
-        string? dir = AppContext.BaseDirectory;
-        while (dir != null)
-        {
-            if (File.Exists(Path.Combine(dir, "pixi.toml")))
-                return dir;
-            dir = Path.GetDirectoryName(dir);
-        }
-        // Fallback: exe directory
         return AppContext.BaseDirectory;
     }
 

@@ -276,14 +276,7 @@ internal sealed class WebSocketClient
         }
         if (key == null) return false;
 
-        // Compute accept key
-        string acceptKey;
-        using (var sha1 = SHA1.Create())
-        {
-            string magic = key + "258EAFA5-E914-47DA-95CA-5AB9283F31B3";
-            byte[] hash = sha1.ComputeHash(Encoding.ASCII.GetBytes(magic));
-            acceptKey = Convert.ToBase64String(hash);
-        }
+        string acceptKey = ComputeAcceptKey(key);
 
         // Send handshake response
         string response = "HTTP/1.1 101 Switching Protocols\r\n" +
@@ -295,6 +288,14 @@ internal sealed class WebSocketClient
         _stream.Write(responseBytes, 0, responseBytes.Length);
         _stream.Flush();
         return true;
+    }
+
+    internal static string ComputeAcceptKey(string key)
+    {
+        using var sha1 = SHA1.Create();
+        const string magicGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        byte[] hash = sha1.ComputeHash(Encoding.ASCII.GetBytes(key + magicGuid));
+        return Convert.ToBase64String(hash);
     }
 
     public string? ReadTextMessage()

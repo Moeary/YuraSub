@@ -54,6 +54,8 @@ def test_default_style_matches_overlay():
     assert style["outlineOpacity"] == 100
     assert style["controlColor"] == "#f5fff8e6"
     assert style["controlOpacity"] == 90
+    assert style["controlBackgroundColor"] == "#0c121e00"
+    assert style["controlBackgroundOpacity"] == 0
     assert style["backgroundColor"] == "#00000000"
     assert style["backgroundOpacity"] == 0
 

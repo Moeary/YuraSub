@@ -449,6 +449,8 @@ class SubtitleOverlayWindow(QWidget):
         self._media_paused = True
         self._control_color = QColor(DEFAULT_CONFIG["style"]["controlColor"])
         self._control_opacity = int(DEFAULT_CONFIG["style"]["controlOpacity"])
+        self._control_background_color = QColor(DEFAULT_CONFIG["style"]["controlBackgroundColor"])
+        self._control_background_opacity = int(DEFAULT_CONFIG["style"]["controlBackgroundOpacity"])
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
         self._status_timer.timeout.connect(lambda: self._clear_status())
@@ -485,6 +487,11 @@ class SubtitleOverlayWindow(QWidget):
             self._control_color = _color(cc, DEFAULT_CONFIG["style"]["controlColor"])
             self._control_opacity = _as_int(co, int(DEFAULT_CONFIG["style"]["controlOpacity"]), 0, 100)
             self._control_color.setAlpha(round(self._control_opacity * 255 / 100))
+            bg = style_cfg.get("controlBackgroundColor", DEFAULT_CONFIG["style"]["controlBackgroundColor"])
+            bgo = style_cfg.get("controlBackgroundOpacity", DEFAULT_CONFIG["style"]["controlBackgroundOpacity"])
+            self._control_background_color = _color(bg, DEFAULT_CONFIG["style"]["controlBackgroundColor"])
+            self._control_background_opacity = _as_int(bgo, int(DEFAULT_CONFIG["style"]["controlBackgroundOpacity"]), 0, 100)
+            self._control_background_color.setAlpha(round(self._control_background_opacity * 255 / 100))
             self._update_control_stylesheet()
 
         self._sync_controls_from_style()
@@ -518,6 +525,8 @@ class SubtitleOverlayWindow(QWidget):
         # Persist control color (not part of canvas rendering style).
         style["controlColor"] = color_to_css(self._control_color)
         style["controlOpacity"] = self._control_opacity
+        style["controlBackgroundColor"] = color_to_css(self._control_background_color)
+        style["controlBackgroundOpacity"] = self._control_background_opacity
         return {
             "schemaVersion": CONFIG_SCHEMA_VERSION,
             "server": dict(self._config.get("server", DEFAULT_CONFIG["server"])),
@@ -605,7 +614,11 @@ class SubtitleOverlayWindow(QWidget):
         self.font_size_spin = _spin(12, 120, int(DEFAULT_STYLE["fontSize"]))
         self.text_color_button = ColorToolButton("正文颜色", _color(DEFAULT_STYLE["textColor"], "#ffffff"))
         self.outline_color_button = ColorToolButton("描边", _color(DEFAULT_STYLE["outlineColor"], "#101522"))
-        self.control_color_button = ColorToolButton("图标颜色", _color(DEFAULT_CONFIG["style"]["controlColor"], "#f5fff8e6"))
+        self.control_color_button = ColorToolButton("控件颜色", _color(DEFAULT_CONFIG["style"]["controlColor"], "#f5fff8e6"))
+        self.control_background_button = ColorToolButton(
+            "控件背景",
+            _color(DEFAULT_CONFIG["style"]["controlBackgroundColor"], "#0c121e00"),
+        )
 
         panel_layout.addWidget(QLabel("字体"), 0, 0)
         panel_layout.addWidget(self.font_combo, 0, 1)
@@ -614,6 +627,7 @@ class SubtitleOverlayWindow(QWidget):
         panel_layout.addWidget(self.text_color_button, 0, 4)
         panel_layout.addWidget(self.outline_color_button, 0, 5)
         panel_layout.addWidget(self.control_color_button, 0, 6)
+        panel_layout.addWidget(self.control_background_button, 0, 7)
         panel_layout.setColumnStretch(1, 1)
 
         root.addWidget(self.style_panel)
@@ -635,6 +649,7 @@ class SubtitleOverlayWindow(QWidget):
         self.text_color_button.set_color_changed_callback(lambda color: self._apply_control_style({"textColor": color_to_css(color)}))
         self.outline_color_button.set_color_changed_callback(lambda color: self._apply_control_style({"outlineColor": color_to_css(color)}))
         self.control_color_button.set_color_changed_callback(lambda color: self._apply_control_color(color))
+        self.control_background_button.set_color_changed_callback(lambda color: self._apply_control_background(color))
 
     def toggle_style_panel(self) -> None:
         self.style_panel.setVisible(self.style_panel.isHidden())
@@ -667,18 +682,31 @@ class SubtitleOverlayWindow(QWidget):
         self.update()  # repaint grip
         self.style_changed.emit(self.style)
 
+    def _apply_control_background(self, color: QColor) -> None:
+        """Apply the toolbar/button background color and alpha."""
+        if self._syncing_controls:
+            return
+        self._control_background_color = QColor(color)
+        self._control_background_opacity = round(color.alpha() * 100 / 255)
+        self._update_control_stylesheet()
+        self.update()
+        self.style_changed.emit(self.style)
+
     def _update_control_stylesheet(self) -> None:
         """Rebuild the controls stylesheet using the current control color."""
         c = self._control_color
         alpha = max(c.alpha(), 72)
+        bg = self._control_background_color
+        bg_alpha = bg.alpha()
+        hover_alpha = max(34, min(210, bg_alpha + 34))
         css = f"""
             QWidget#overlayToolbar {{
-                background: rgba(12, 18, 20, 0);
+                background: rgba({bg.red()}, {bg.green()}, {bg.blue()}, {bg_alpha});
                 border: 1px solid rgba(229, 241, 232, 18);
                 border-radius: 12px;
             }}
             QWidget#overlayStylePanel {{
-                background: rgba(12, 18, 20, 30);
+                background: rgba({bg.red()}, {bg.green()}, {bg.blue()}, {max(bg_alpha, 30)});
                 border: 1px solid rgba(229, 241, 232, 34);
                 border-radius: 12px;
             }}
@@ -691,7 +719,7 @@ class SubtitleOverlayWindow(QWidget):
                 padding: 3px 8px;
             }}
             QToolButton:hover {{
-                background: rgba({c.red()}, {c.green()}, {c.blue()}, 34);
+                background: rgba({bg.red()}, {bg.green()}, {bg.blue()}, {hover_alpha});
                 border-radius: 8px;
             }}
             QLabel {{
@@ -735,6 +763,7 @@ class SubtitleOverlayWindow(QWidget):
         self.outline_color_button.set_color(_color(style.get("outlineColor"), DEFAULT_STYLE["outlineColor"]))
         # Control color comes from the overlay field, not from canvas style.
         self.control_color_button.set_color(self._control_color)
+        self.control_background_button.set_color(self._control_background_color)
         self._syncing_controls = False
 
     def apply_payload(self, payload: dict[str, Any]) -> None:
@@ -795,6 +824,8 @@ class SubtitleOverlayWindow(QWidget):
         # Reset control color.
         self._control_color = QColor(DEFAULT_CONFIG["style"]["controlColor"])
         self._control_opacity = int(DEFAULT_CONFIG["style"]["controlOpacity"])
+        self._control_background_color = QColor(DEFAULT_CONFIG["style"]["controlBackgroundColor"])
+        self._control_background_opacity = int(DEFAULT_CONFIG["style"]["controlBackgroundOpacity"])
         self._update_control_stylesheet()
 
         # Reset geometry.

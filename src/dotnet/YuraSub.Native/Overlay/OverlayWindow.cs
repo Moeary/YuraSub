@@ -21,7 +21,6 @@ internal sealed class OverlayWindow : IDisposable
     private bool _clickThrough;
     private bool _locked;
     private bool _statusActive;
-    private int _statusTimerId;
 
     // Media state
     private double _mediaDuration;
@@ -60,9 +59,22 @@ internal sealed class OverlayWindow : IDisposable
         ["maxLines"] = 4,
     };
 
+    private static readonly string[] ColorPalette =
+    {
+        "#ffffffff",
+        "#f5fff8e6",
+        "#7dd3fccc",
+        "#00a0a3e6",
+        "#ff05deff",
+        "#f7ff0eff",
+        "#101522ff",
+    };
+
     // Control color
     private string _controlColorHex = Config.Defaults.ControlColor;
     private int _controlOpacityPercent = Config.Defaults.ControlOpacity;
+    private string _controlBackgroundColorHex = Config.Defaults.ControlBackgroundColor;
+    private int _controlBackgroundOpacityPercent = Config.Defaults.ControlBackgroundOpacity;
 
     // Win32
     private IntPtr _hwnd;
@@ -112,6 +124,7 @@ internal sealed class OverlayWindow : IDisposable
     public IntPtr Hwnd => _hwnd;
     public bool ClickThrough => _clickThrough;
     public bool Locked => _locked;
+    private bool HasVisibleText => !string.IsNullOrEmpty(_text) || !string.IsNullOrEmpty(_translation);
 
     public OverlayWindow(JsonObject config)
     {
@@ -129,9 +142,11 @@ internal sealed class OverlayWindow : IDisposable
                 _localOverrideKeys.Add(kv.Key);
         }
 
-        // Restore control color
+        // Restore control colors.
         _controlColorHex = Config.GetString(config, "style", "controlColor", Config.Defaults.ControlColor);
         _controlOpacityPercent = Config.GetInt(config, "style", "controlOpacity", Config.Defaults.ControlOpacity);
+        _controlBackgroundColorHex = Config.GetString(config, "style", "controlBackgroundColor", Config.Defaults.ControlBackgroundColor);
+        _controlBackgroundOpacityPercent = Config.GetInt(config, "style", "controlBackgroundOpacity", Config.Defaults.ControlBackgroundOpacity);
     }
 
     public bool Create()
@@ -167,6 +182,10 @@ internal sealed class OverlayWindow : IDisposable
         // Restore geometry from config
         int winW = Config.GetInt(_config, "window", "width", Config.Defaults.WindowWidth);
         int winH = Config.GetInt(_config, "window", "height", Config.Defaults.WindowHeight);
+        if (winW < 280) winW = Config.Defaults.WindowWidth;
+        if (winH < 80) winH = Config.Defaults.WindowHeight;
+        winW = Math.Max(280, Math.Min(winW, Math.Max(280, screenW)));
+        winH = Math.Max(80, Math.Min(winH, Math.Max(80, screenH)));
         int winX, winY;
         if (_config.TryGetValue("window", out var w) && w is JsonObject winObj &&
             winObj.TryGetValue("x", out var xVal) && xVal is not JsonNull &&
@@ -193,9 +212,9 @@ internal sealed class OverlayWindow : IDisposable
         if (_config.TryGetValue("window", out var winCfg) && winCfg is JsonObject wObj)
         {
             bool locked = Payload.ReadBool(wObj.TryGetValue("locked", out var lk) ? lk : null) ?? false;
-            bool ct = Payload.ReadBool(wObj.TryGetValue("clickThrough", out var ctv) ? ctv : null) ?? false;
             if (locked) SetLocked(true);
-            else if (ct) SetClickThrough(true);
+            else
+                SetClickThrough(false);
         }
 
         Win32.ShowWindow(_hwnd, Win32.SW_SHOWNOACTIVATE);
@@ -226,27 +245,41 @@ internal sealed class OverlayWindow : IDisposable
         }
     }
 
-    public void Show() => Win32.ShowWindow(_hwnd, Win32.SW_SHOW);
+    public void Show()
+    {
+        Win32.ShowWindow(_hwnd, Win32.SW_SHOWNOACTIVATE);
+        RequestRepaint();
+    }
+
     public void Hide() => Win32.ShowWindow(_hwnd, Win32.SW_HIDE);
     public void Raise()
     {
         Win32.SetWindowPos(_hwnd, Win32.HWND_TOPMOST, 0, 0, 0, 0,
             Win32.SWP_NOMOVE | Win32.SWP_NOSIZE | Win32.SWP_SHOWWINDOW);
+        RequestRepaint();
+    }
+
+    private void RequestRepaint()
+    {
+        if (_hwnd == IntPtr.Zero) return;
+        Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+        Win32.UpdateWindow(_hwnd);
     }
 
     public void SetSubtitle(string text, string translation)
     {
         _text = Payload.CleanText(text);
         _translation = Payload.CleanText(translation);
-        Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+        RequestRepaint();
     }
 
     public void ClearSubtitle()
     {
         _statusActive = false;
+        Win32.KillTimer(_hwnd, Win32.TIMER_STATUS);
         _text = "";
         _translation = "";
-        Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+        RequestRepaint();
     }
 
     public void ShowStatus(string text, string secondary, int timeoutMs = 4000)
@@ -272,7 +305,7 @@ internal sealed class OverlayWindow : IDisposable
         Win32.SetWindowLongW(_hwnd, Win32.GWL_EXSTYLE, (uint)exStyle);
         Win32.SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, 0, 0,
             Win32.SWP_NOMOVE | Win32.SWP_NOSIZE | Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE | Win32.SWP_FRAMECHANGED);
-        Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+        RequestRepaint();
         OnClickThroughChanged?.Invoke(enabled);
     }
 
@@ -282,7 +315,7 @@ internal sealed class OverlayWindow : IDisposable
         _locked = enabled;
         SetClickThrough(enabled);
         OnLockChanged?.Invoke(enabled);
-        Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+        RequestRepaint();
     }
 
     public void UnlockForEditing()
@@ -291,6 +324,7 @@ internal sealed class OverlayWindow : IDisposable
         SetClickThrough(false);
         Show();
         Raise();
+        RequestRepaint();
     }
 
     public void ApplyPayload(JsonObject payload)
@@ -331,7 +365,7 @@ internal sealed class OverlayWindow : IDisposable
             }
         }
         OnStyleChanged?.Invoke(_style);
-        Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+        RequestRepaint();
     }
 
     public void ApplyCommand(JsonObject payload)
@@ -369,7 +403,7 @@ internal sealed class OverlayWindow : IDisposable
         _mediaDuration = duration;
         _mediaPosition = position;
         _mediaPaused = Payload.ReadBool(media.TryGetValue("paused", out var pa) ? pa : null) ?? true;
-        Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+        RequestRepaint();
     }
 
     private void ApplyGeometry(JsonObject geometry)
@@ -384,6 +418,7 @@ internal sealed class OverlayWindow : IDisposable
             int x = gx is JsonNumber gxn ? gxn.ToInt() : 200;
             int y = gy is JsonNumber gyn ? gyn.ToInt() : 500;
             Win32.MoveWindow(_hwnd, x, y, w, h, true);
+            RequestRepaint();
             return;
         }
 
@@ -401,15 +436,24 @@ internal sealed class OverlayWindow : IDisposable
         int x2 = (screenW - w) / 2;
         int y2 = anchor == "top" ? 80 : screenH - h - marginBottom;
         Win32.MoveWindow(_hwnd, x2, y2, w, h, true);
+        RequestRepaint();
     }
 
     public JsonObject SaveState()
     {
         Win32.GetWindowRect(_hwnd, out var rect);
+        int width = rect.Right - rect.Left;
+        int height = rect.Bottom - rect.Top;
+        if (width < 280)
+            width = Config.Defaults.WindowWidth;
+        if (height < 80)
+            height = Config.Defaults.WindowHeight;
         var style = new JsonObject();
         foreach (var kv in _style) style[kv.Key] = kv.Value;
         style["controlColor"] = _controlColorHex;
         style["controlOpacity"] = _controlOpacityPercent;
+        style["controlBackgroundColor"] = _controlBackgroundColorHex;
+        style["controlBackgroundOpacity"] = _controlBackgroundOpacityPercent;
 
         return new JsonObject
         {
@@ -423,8 +467,8 @@ internal sealed class OverlayWindow : IDisposable
             {
                 ["x"] = rect.Left,
                 ["y"] = rect.Top,
-                ["width"] = rect.Right - rect.Left,
-                ["height"] = rect.Bottom - rect.Top,
+                ["width"] = width,
+                ["height"] = height,
                 ["clickThrough"] = _clickThrough,
                 ["locked"] = _locked,
             },
@@ -441,6 +485,8 @@ internal sealed class OverlayWindow : IDisposable
         foreach (var kv in DefaultStyle) _localOverrideKeys.Add(kv.Key);
         _controlColorHex = Config.Defaults.ControlColor;
         _controlOpacityPercent = Config.Defaults.ControlOpacity;
+        _controlBackgroundColorHex = Config.Defaults.ControlBackgroundColor;
+        _controlBackgroundOpacityPercent = Config.Defaults.ControlBackgroundOpacity;
         UnlockForEditing();
 
         var devMode = new Win32.DEVMODE { dmSize = (ushort)Marshal.SizeOf<Win32.DEVMODE>() };
@@ -454,7 +500,7 @@ internal sealed class OverlayWindow : IDisposable
         int x = (screenW - w) / 2;
         int y = screenH - Config.Defaults.WindowHeight - 80;
         Win32.MoveWindow(_hwnd, x, y, w, Config.Defaults.WindowHeight, true);
-        Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+        RequestRepaint();
         OnStyleChanged?.Invoke(_style);
     }
 
@@ -534,10 +580,11 @@ internal sealed class OverlayWindow : IDisposable
             }
 
             // Check slider hit
-            if (_hoveringSlider && _mediaDuration > 0)
+            if (_mediaDuration > 0 && x >= _sliderX && x < _sliderX + _sliderW && y >= _sliderY - 8 && y < _sliderY + _sliderH + 8)
             {
                 _sliderDragging = true;
                 UpdateSliderFromMouse(x);
+                Win32.SetCapture(_hwnd);
                 return;
             }
         }
@@ -583,7 +630,7 @@ internal sealed class OverlayWindow : IDisposable
                 OnMediaSeek?.Invoke(seekTime);
             }
             Win32.ReleaseCapture();
-            Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+            RequestRepaint();
             return;
         }
 
@@ -624,11 +671,13 @@ internal sealed class OverlayWindow : IDisposable
 
         if (_dragMode == "resize")
         {
-            int dx = x - _dragStartX;
-            int dy = y - _dragStartY;
+            Win32.GetCursorPos(out var screenPt);
+            int dx = screenPt.X - _dragStartX;
+            int dy = screenPt.Y - _dragStartY;
             int newW = Math.Max(280, _dragStartWidth + dx);
             int newH = Math.Max(80, _dragStartHeight + dy);
             Win32.MoveWindow(_hwnd, _dragStartLeft, _dragStartTop, newW, newH, true);
+            RequestRepaint();
         }
         else if (_dragMode == "move")
         {
@@ -637,6 +686,7 @@ internal sealed class OverlayWindow : IDisposable
             int newX = screenPt.X - (_dragStartX - _dragStartLeft);
             int newY = screenPt.Y - (_dragStartY - _dragStartTop);
             Win32.MoveWindow(_hwnd, newX, newY, _dragStartWidth, _dragStartHeight, true);
+            RequestRepaint();
         }
     }
 
@@ -646,7 +696,7 @@ internal sealed class OverlayWindow : IDisposable
         float ratio = (float)(x - _sliderX) / _sliderW;
         ratio = Math.Max(0, Math.Min(1, ratio));
         _mediaPosition = _mediaDuration * ratio;
-        Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+        RequestRepaint();
     }
 
     private void HandleControlClick(string command)
@@ -670,7 +720,25 @@ internal sealed class OverlayWindow : IDisposable
                 break;
             case "style":
                 _stylePanelVisible = !_stylePanelVisible;
-                Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+                RequestRepaint();
+                break;
+            case "textColor":
+                CycleStyleColor("textColor");
+                break;
+            case "outlineColor":
+                CycleStyleColor("outlineColor");
+                break;
+            case "controlColor":
+                CycleControlColor();
+                break;
+            case "controlBackground":
+                CycleControlBackgroundColor();
+                break;
+            case "controlBackgroundOpacityDown":
+                StepControlBackgroundOpacity(-10);
+                break;
+            case "controlBackgroundOpacityUp":
+                StepControlBackgroundOpacity(10);
                 break;
             case "clear":
                 ClearSubtitle();
@@ -691,6 +759,57 @@ internal sealed class OverlayWindow : IDisposable
             ["translationFontSize"] = Math.Max(10, Math.Min(96, tfs + delta)),
         };
         ApplyStyle(style, true);
+    }
+
+    private void CycleStyleColor(string key)
+    {
+        string current = GetStyleString(key, ColorPalette[0]);
+        var style = new JsonObject { [key] = NextPaletteColor(current) };
+        ApplyStyle(style, true);
+    }
+
+    private void CycleControlColor()
+    {
+        _controlColorHex = NextPaletteColor(_controlColorHex);
+        OnStyleChanged?.Invoke(_style);
+        RequestRepaint();
+    }
+
+    private void CycleControlBackgroundColor()
+    {
+        _controlBackgroundColorHex = NextPaletteColor(_controlBackgroundColorHex);
+        OnStyleChanged?.Invoke(_style);
+        RequestRepaint();
+    }
+
+    private void StepControlBackgroundOpacity(int delta)
+    {
+        _controlBackgroundOpacityPercent = Math.Max(0, Math.Min(100, _controlBackgroundOpacityPercent + delta));
+        OnStyleChanged?.Invoke(_style);
+        RequestRepaint();
+    }
+
+    private static string NextPaletteColor(string current)
+    {
+        string normalized = NormalizeColorKey(current);
+        int index = 0;
+        for (int i = 0; i < ColorPalette.Length; i++)
+        {
+            if (NormalizeColorKey(ColorPalette[i]) == normalized)
+            {
+                index = (i + 1) % ColorPalette.Length;
+                break;
+            }
+        }
+        return ColorPalette[index];
+    }
+
+    private static string NormalizeColorKey(string color)
+    {
+        string hex = color.Trim().TrimStart('#');
+        if (hex.Length >= 6)
+            return hex.Substring(0, 6).ToLowerInvariant();
+        return hex.ToLowerInvariant();
     }
 
     private int GetStyleInt(string key, int defaultValue)
@@ -762,7 +881,8 @@ internal sealed class OverlayWindow : IDisposable
 
         // Unlock/interactive
         string interactiveLabel = "解锁拖动/显示控制";
-        Win32.AppendMenuW(menu, _locked ? 0x00000000u : 0x00000008u, (IntPtr)TRAY_ID_TOGGLE_INTERACTIVE, interactiveLabel);
+        bool alreadyInteractive = !_locked && !_clickThrough;
+        Win32.AppendMenuW(menu, alreadyInteractive ? 0x00000008u : 0x00000000u, (IntPtr)TRAY_ID_TOGGLE_INTERACTIVE, interactiveLabel);
 
         // Lock
         Win32.AppendMenuW(menu, _locked ? 0x00000008u : 0x00000000u, (IntPtr)TRAY_ID_LOCK, "锁定字幕");
@@ -783,8 +903,10 @@ internal sealed class OverlayWindow : IDisposable
         Win32.AppendMenuW(menu, 0x00000000, (IntPtr)TRAY_ID_QUIT, "退出");
 
         Win32.GetCursorPos(out var pt);
-        Win32.TrackPopupMenu(menu, 0x0100, pt.X, pt.Y, 0, _hwnd, IntPtr.Zero); // TPM_RIGHTALIGN
+        int command = Win32.TrackPopupMenu(menu, Win32.TPM_RETURNCMD | Win32.TPM_RIGHTBUTTON, pt.X, pt.Y, 0, _hwnd, IntPtr.Zero);
         Win32.DestroyMenu(menu);
+        if (command != 0)
+            OnTrayCommand(command);
     }
 
     private void OnTrayCommand(int id)
@@ -840,27 +962,33 @@ internal sealed class OverlayWindow : IDisposable
         _controlButtons.Clear();
         if (!_locked)
         {
-            float btnY = 8;
+            float toolbarY = 8;
+            float toolbarH = 42;
+            float btnY = toolbarY + 4;
             float btnH = 34;
-            float btnX = 20;
-            float gap = 8;
+            float gap = 18;
+            float sliderDesired = Math.Max(260, Math.Min(780, w * 0.42f));
+            float fixedWidth = 40 + 40 + 44 + 96 + 44 + 40 + 36 + 36 + 36 + gap * 8;
+            float sliderW = Math.Max(120, Math.Min(sliderDesired, Math.Max(120, w - 56 - fixedWidth)));
+            float groupW = fixedWidth + sliderW;
+            float btnX = Math.Max(22, (w - groupW) / 2);
 
             AddButton("A+", "增大字号", "fontBigger", ref btnX, btnY, 40, btnH, gap);
             AddButton("A-", "减小字号", "fontSmaller", ref btnX, btnY, 40, btnH, gap);
             AddButton("◀▌", "上一首", "previousTrack", ref btnX, btnY, 44, btnH, gap);
 
             // Slider
-            _sliderX = btnX + 4;
+            _sliderX = btnX;
             _sliderY = btnY + 8;
-            _sliderW = Math.Max(100, w - btnX - 340);
+            _sliderW = sliderW;
             _sliderH = btnH - 16;
-            btnX += _sliderW + 12;
+            btnX += _sliderW + gap;
 
             // Time label
             string timeText = FormatTime(_mediaPosition) + " / " + FormatTime(_mediaDuration);
             // We'll draw this as text, not a button
             float timeX = btnX;
-            btnX += 100;
+            btnX += 96 + gap;
 
             AddButton("▐▶", "下一首", "nextTrack", ref btnX, btnY, 44, btnH, gap);
             AddButton(_mediaPaused ? "▶" : "Ⅱ", "播放/暂停", "playPause", ref btnX, btnY, 40, btnH, gap);
@@ -869,13 +997,14 @@ internal sealed class OverlayWindow : IDisposable
             AddButton("▣", "锁定并点击穿透", "lock", ref btnX, btnY, 36, btnH, gap);
 
             // Draw controls background
+            ParseColor(_controlBackgroundColorHex, _controlBackgroundOpacityPercent, out float bgR, out float bgG, out float bgB, out float bgA);
             var controlBg = new D2D1_ROUNDED_RECT
             {
-                Rect = new D2D1_RECT_F { Left = 4, Top = 4, Right = w - 4, Bottom = btnY + btnH + 4 },
+                Rect = new D2D1_RECT_F { Left = 8, Top = toolbarY, Right = w - 8, Bottom = toolbarY + toolbarH },
                 RadiusX = 12,
                 RadiusY = 12,
             };
-            var bgBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = 12f/255, G = 18f/255, B = 20f/255, A = 0.12f });
+            var bgBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = bgR, G = bgG, B = bgB, A = bgA });
             D2DFactory.FillRoundedRect(_renderTarget, controlBg, bgBrush);
             D2DFactory.Release(bgBrush);
 
@@ -902,12 +1031,15 @@ internal sealed class OverlayWindow : IDisposable
             DrawText(timeText, timeX, btnY + 2, 96, btnH - 4, btnBrush, 12, 400);
 
             D2DFactory.Release(btnBrush);
+
+            if (_stylePanelVisible)
+                DrawStylePanel(w, toolbarY + toolbarH + 4, controlColor, new D2D1_COLOR_F { R = bgR, G = bgG, B = bgB, A = bgA });
         }
 
         // Draw subtitle text
-        if (!string.IsNullOrEmpty(_text) || !string.IsNullOrEmpty(_translation))
+        if (HasVisibleText)
         {
-            float textTop = _locked ? 8 : 52;
+            float textTop = _locked ? 8 : (_stylePanelVisible ? 102 : 52);
             float textAreaW = w - 36;
             float textAreaH = h - textTop - 8;
 
@@ -937,14 +1069,18 @@ internal sealed class OverlayWindow : IDisposable
                 DrawSubtitleText(textTop, textAreaW, textAreaH);
             }
         }
-
         // Draw edit mode border and grip
         if (!_clickThrough)
         {
             var borderC = new D2D1_COLOR_F { R = 125f/255, G = 211f/255, B = 252f/255, A = 0.47f };
             var borderB = D2DFactory.CreateSolidColorBrush(_renderTarget, borderC);
-            var borderRect = new D2D1_RECT_F { Left = 1, Top = 1, Right = w - 2, Bottom = h - 2 };
-            D2DFactory.DrawRectangle(_renderTarget, borderRect, borderB, 1.5f, IntPtr.Zero);
+            var borderRect = new D2D1_ROUNDED_RECT
+            {
+                Rect = new D2D1_RECT_F { Left = 1, Top = 1, Right = w - 2, Bottom = h - 2 },
+                RadiusX = 10,
+                RadiusY = 10,
+            };
+            D2DFactory.DrawRoundedRect(_renderTarget, borderRect, borderB, 1.5f, IntPtr.Zero);
 
             // Grip lines
             ParseColor(_controlColorHex, _controlOpacityPercent, out float gcR, out float gcG, out float gcB, out float gcA);
@@ -964,6 +1100,71 @@ internal sealed class OverlayWindow : IDisposable
 
         D2DFactory.EndDraw(_renderTarget);
         Win32.ValidateRect(_hwnd, IntPtr.Zero);
+    }
+
+    private void DrawStylePanel(int w, float top, D2D1_COLOR_F controlColor, D2D1_COLOR_F controlBackground)
+    {
+        float panelH = 46;
+        float panelLeft = 8;
+        float panelRight = w - 8;
+
+        var panelRect = new D2D1_ROUNDED_RECT
+        {
+            Rect = new D2D1_RECT_F { Left = panelLeft, Top = top, Right = panelRight, Bottom = top + panelH },
+            RadiusX = 12,
+            RadiusY = 12,
+        };
+
+        var bg = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F
+        {
+            R = controlBackground.R,
+            G = controlBackground.G,
+            B = controlBackground.B,
+            A = Math.Max(controlBackground.A, 30f / 255),
+        });
+        D2DFactory.FillRoundedRect(_renderTarget, panelRect, bg);
+        D2DFactory.Release(bg);
+
+        var border = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = 229f / 255, G = 241f / 255, B = 232f / 255, A = 34f / 255 });
+        D2DFactory.DrawRoundedRect(_renderTarget, panelRect, border, 1, IntPtr.Zero);
+        D2DFactory.Release(border);
+
+        var brush = D2DFactory.CreateSolidColorBrush(_renderTarget, controlColor);
+        float btnY = top + 6;
+        float btnH = 34;
+        float gap = 12;
+        float totalW = 86 + 86 + 86 + 86 + 74 + 74 + gap * 5;
+        float x = Math.Max(panelLeft + 14, (w - totalW) / 2);
+
+        AddButton("正文颜色", "循环正文颜色", "textColor", ref x, btnY, 86, btnH, gap);
+        AddButton("描边颜色", "循环描边颜色", "outlineColor", ref x, btnY, 86, btnH, gap);
+        AddButton("控件颜色", "循环控件颜色", "controlColor", ref x, btnY, 86, btnH, gap);
+        AddButton("控件背景", "循环控件背景颜色", "controlBackground", ref x, btnY, 86, btnH, gap);
+        AddButton("背景-", "降低控件背景不透明度", "controlBackgroundOpacityDown", ref x, btnY, 74, btnH, gap);
+        AddButton("背景+", "提高控件背景不透明度", "controlBackgroundOpacityUp", ref x, btnY, 74, btnH, gap);
+
+        for (int i = _controlButtons.Count - 6; i < _controlButtons.Count; i++)
+        {
+            var btn = _controlButtons[i];
+            var buttonBg = new D2D1_ROUNDED_RECT
+            {
+                Rect = new D2D1_RECT_F { Left = btn.X, Top = btn.Y, Right = btn.X + btn.W, Bottom = btn.Y + btn.H },
+                RadiusX = 8,
+                RadiusY = 8,
+            };
+            var bgBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F
+            {
+                R = controlBackground.R,
+                G = controlBackground.G,
+                B = controlBackground.B,
+                A = Math.Max(0.10f, Math.Min(0.82f, controlBackground.A + 0.18f)),
+            });
+            D2DFactory.FillRoundedRect(_renderTarget, buttonBg, bgBrush);
+            D2DFactory.Release(bgBrush);
+            DrawText(btn.Label, btn.X + 4, btn.Y + 2, btn.W - 8, btn.H - 4, brush, 14, 600);
+        }
+
+        D2DFactory.Release(brush);
     }
 
     private void AddButton(string label, string tooltip, string command, ref float x, float y, float w, float h, float gap)

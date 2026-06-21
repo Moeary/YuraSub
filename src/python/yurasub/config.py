@@ -52,6 +52,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "outlineOpacity": 100,
         "controlColor": "#f5fff8e6",
         "controlOpacity": 90,
+        "controlBackgroundColor": "#0c121e00",
+        "controlBackgroundOpacity": 0,
         "backgroundColor": "#00000000",
         "backgroundOpacity": 0,
     },

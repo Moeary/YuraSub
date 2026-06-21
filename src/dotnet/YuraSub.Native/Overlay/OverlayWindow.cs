@@ -170,43 +170,38 @@ internal sealed class OverlayWindow : IDisposable
         uint exStyle = Win32.WS_EX_LAYERED | Win32.WS_EX_TOOLWINDOW | Win32.WS_EX_TOPMOST | Win32.WS_EX_NOACTIVATE;
         uint style = Win32.WS_POPUP | Win32.WS_VISIBLE;
 
-        // Get screen size for default placement
-        var devMode = new Win32.DEVMODE { dmSize = (ushort)Marshal.SizeOf<Win32.DEVMODE>() };
-        int screenW = 1920, screenH = 1080;
-        if (Win32.EnumDisplaySettingsW(null, -1, ref devMode))
-        {
-            screenW = (int)devMode.dmPelsWidth;
-            screenH = (int)devMode.dmPelsHeight;
-        }
-
         // Restore geometry from config
         int winW = Config.GetInt(_config, "window", "width", Config.Defaults.WindowWidth);
         int winH = Config.GetInt(_config, "window", "height", Config.Defaults.WindowHeight);
-        if (winW < 280) winW = Config.Defaults.WindowWidth;
-        if (winH < 80) winH = Config.Defaults.WindowHeight;
-        winW = Math.Max(280, Math.Min(winW, Math.Max(280, screenW)));
-        winH = Math.Max(80, Math.Min(winH, Math.Max(80, screenH)));
+        winW = Math.Max(280, winW);
+        winH = Math.Max(80, winH);
+
         int winX, winY;
         if (_config.TryGetValue("window", out var w) && w is JsonObject winObj &&
             winObj.TryGetValue("x", out var xVal) && xVal is not JsonNull &&
             winObj.TryGetValue("y", out var yVal) && yVal is not JsonNull)
         {
-            winX = xVal is JsonNumber xn ? xn.ToInt() : 200;
-            winY = yVal is JsonNumber yn ? yn.ToInt() : 500;
+            winX = xVal is JsonNumber xn ? xn.ToInt() : int.MinValue;
+            winY = yVal is JsonNumber yn ? yn.ToInt() : int.MinValue;
         }
         else
         {
-            winX = (screenW - winW) / 2;
-            winY = screenH - winH - 80;
+            winX = int.MinValue;
+            winY = int.MinValue;
         }
+
+        // Validate position against monitor work areas
+        ClampToMonitor(ref winX, ref winY, winW, winH);
 
         _hwnd = Win32.CreateWindowExW(exStyle, className, "YuraSub", style,
             winX, winY, winW, winH, IntPtr.Zero, IntPtr.Zero, _hInstance, IntPtr.Zero);
 
         if (_hwnd == IntPtr.Zero) return false;
 
-        // Make transparent
-        Win32.SetLayeredWindowAttributes(_hwnd, 0, 255, 0x01); // LWA_ALPHA
+        // Make transparent — use LWA_ALPHA (0x02), NOT LWA_COLORKEY (0x01).
+        // LWA_COLORKEY would make all RGB(0,0,0) pixels fully transparent,
+        // breaking shadows and causing visual artifacts.
+        Win32.SetLayeredWindowAttributes(_hwnd, 0, 255, 0x02); // LWA_ALPHA
 
         // Restore lock state
         if (_config.TryGetValue("window", out var winCfg) && winCfg is JsonObject wObj)
@@ -415,8 +410,9 @@ internal sealed class OverlayWindow : IDisposable
 
         if (geometry.TryGetValue("x", out var gx) && geometry.TryGetValue("y", out var gy))
         {
-            int x = gx is JsonNumber gxn ? gxn.ToInt() : 200;
-            int y = gy is JsonNumber gyn ? gyn.ToInt() : 500;
+            int x = gx is JsonNumber gxn ? gxn.ToInt() : int.MinValue;
+            int y = gy is JsonNumber gyn ? gyn.ToInt() : int.MinValue;
+            ClampToMonitor(ref x, ref y, w, h);
             Win32.MoveWindow(_hwnd, x, y, w, h, true);
             RequestRepaint();
             return;
@@ -425,16 +421,13 @@ internal sealed class OverlayWindow : IDisposable
         string anchor = geometry.TryGetValue("anchor", out var a) ? a.ToString() : "bottom";
         int marginBottom = geometry.TryGetValue("marginBottom", out var mb) && mb is JsonNumber mbn ? mbn.ToInt() : 80;
 
-        var devMode = new Win32.DEVMODE { dmSize = (ushort)Marshal.SizeOf<Win32.DEVMODE>() };
-        int screenW = 1920, screenH = 1080;
-        if (Win32.EnumDisplaySettingsW(null, -1, ref devMode))
-        {
-            screenW = (int)devMode.dmPelsWidth;
-            screenH = (int)devMode.dmPelsHeight;
-        }
+        var areas = GetAllMonitorWorkAreas();
+        var primary = areas.Count > 0 ? areas[0] : new Win32.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
+        int screenW = primary.Right - primary.Left;
+        int screenH = primary.Bottom - primary.Top;
 
-        int x2 = (screenW - w) / 2;
-        int y2 = anchor == "top" ? 80 : screenH - h - marginBottom;
+        int x2 = primary.Left + (screenW - w) / 2;
+        int y2 = anchor == "top" ? primary.Top + 80 : primary.Bottom - h - marginBottom;
         Win32.MoveWindow(_hwnd, x2, y2, w, h, true);
         RequestRepaint();
     }
@@ -442,12 +435,12 @@ internal sealed class OverlayWindow : IDisposable
     public JsonObject SaveState()
     {
         Win32.GetWindowRect(_hwnd, out var rect);
-        int width = rect.Right - rect.Left;
-        int height = rect.Bottom - rect.Top;
-        if (width < 280)
-            width = Config.Defaults.WindowWidth;
-        if (height < 80)
-            height = Config.Defaults.WindowHeight;
+        int width = Math.Max(280, rect.Right - rect.Left);
+        int height = Math.Max(80, rect.Bottom - rect.Top);
+        int x = rect.Left;
+        int y = rect.Top;
+        // Ensure saved position is on-screen
+        ClampToMonitor(ref x, ref y, width, height);
         var style = new JsonObject();
         foreach (var kv in _style) style[kv.Key] = kv.Value;
         style["controlColor"] = _controlColorHex;
@@ -465,8 +458,8 @@ internal sealed class OverlayWindow : IDisposable
             },
             ["window"] = new JsonObject
             {
-                ["x"] = rect.Left,
-                ["y"] = rect.Top,
+                ["x"] = x,
+                ["y"] = y,
                 ["width"] = width,
                 ["height"] = height,
                 ["clickThrough"] = _clickThrough,
@@ -489,16 +482,12 @@ internal sealed class OverlayWindow : IDisposable
         _controlBackgroundOpacityPercent = Config.Defaults.ControlBackgroundOpacity;
         UnlockForEditing();
 
-        var devMode = new Win32.DEVMODE { dmSize = (ushort)Marshal.SizeOf<Win32.DEVMODE>() };
-        int screenW = 1920, screenH = 1080;
-        if (Win32.EnumDisplaySettingsW(null, -1, ref devMode))
-        {
-            screenW = (int)devMode.dmPelsWidth;
-            screenH = (int)devMode.dmPelsHeight;
-        }
+        var areas = GetAllMonitorWorkAreas();
+        var primary = areas.Count > 0 ? areas[0] : new Win32.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
+        int screenW = primary.Right - primary.Left;
         int w = Math.Min(Config.Defaults.WindowWidth, (int)(screenW * 0.86));
-        int x = (screenW - w) / 2;
-        int y = screenH - Config.Defaults.WindowHeight - 80;
+        int x = primary.Left + (screenW - w) / 2;
+        int y = primary.Bottom - Config.Defaults.WindowHeight - 80;
         Win32.MoveWindow(_hwnd, x, y, w, Config.Defaults.WindowHeight, true);
         RequestRepaint();
         OnStyleChanged?.Invoke(_style);
@@ -865,13 +854,33 @@ internal sealed class OverlayWindow : IDisposable
         int msg = lParam.ToInt32();
         if (msg == Win32.WM_LBUTTONUP_TRAY)
         {
-            UnlockForEditing();
-            Win32.SetForegroundWindow(_hwnd);
+            ShowAndActivate();
         }
         else if (msg == Win32.WM_RBUTTONUP_TRAY)
         {
             ShowTrayMenu();
         }
+    }
+
+    /// <summary>
+    /// Unlock, show, raise, and ensure the window is on a visible monitor.
+    /// Called from tray left-click and "Show Window" menu.
+    /// </summary>
+    public void ShowAndActivate()
+    {
+        UnlockForEditing();
+        // Ensure window is on a visible monitor
+        Win32.GetWindowRect(_hwnd, out var rect);
+        int w = Math.Max(280, rect.Right - rect.Left);
+        int h = Math.Max(80, rect.Bottom - rect.Top);
+        int x = rect.Left, y = rect.Top;
+        ClampToMonitor(ref x, ref y, w, h);
+        if (x != rect.Left || y != rect.Top)
+            Win32.MoveWindow(_hwnd, x, y, w, h, true);
+        Win32.SetForegroundWindow(_hwnd);
+        Win32.SetWindowPos(_hwnd, Win32.HWND_TOPMOST, 0, 0, 0, 0,
+            Win32.SWP_NOMOVE | Win32.SWP_NOSIZE | Win32.SWP_SHOWWINDOW | Win32.SWP_NOACTIVATE);
+        RequestRepaint();
     }
 
     private void ShowTrayMenu()
@@ -923,7 +932,7 @@ internal sealed class OverlayWindow : IDisposable
                 ClearSubtitle();
                 break;
             case TRAY_ID_SHOW:
-                UnlockForEditing();
+                ShowAndActivate();
                 break;
             case TRAY_ID_RESTORE_DEFAULTS:
                 ResetToDefaults();
@@ -1373,6 +1382,68 @@ internal sealed class OverlayWindow : IDisposable
         int m = (total % 3600) / 60;
         int s = total % 60;
         return h > 0 ? $"{h}:{m:D2}:{s:D2}" : $"{m}:{s:D2}";
+    }
+
+    // --- Monitor helpers ---
+
+    /// <summary>
+    /// Get work-area rects for all monitors.
+    /// </summary>
+    private static List<Win32.RECT> GetAllMonitorWorkAreas()
+    {
+        var areas = new List<Win32.RECT>();
+        Win32.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
+            (IntPtr hMon, IntPtr hdc, ref Win32.RECT rc, IntPtr data) =>
+            {
+                var mi = new Win32.MONITORINFO { cbSize = Marshal.SizeOf<Win32.MONITORINFO>() };
+                if (Win32.GetMonitorInfoW(hMon, ref mi))
+                    areas.Add(mi.rcWork);
+                return true;
+            }, IntPtr.Zero);
+        return areas;
+    }
+
+    /// <summary>
+    /// Clamp a window position so at least 200×80 pixels are visible on some monitor.
+    /// If position is int.MinValue or off-screen, center on primary monitor.
+    /// </summary>
+    private static void ClampToMonitor(ref int x, ref int y, int w, int h)
+    {
+        var areas = GetAllMonitorWorkAreas();
+        if (areas.Count == 0)
+        {
+            // Fallback: center on assumed 1920×1080
+            x = (1920 - w) / 2;
+            y = 1080 - h - 80;
+            return;
+        }
+
+        // Check if the window has sufficient overlap with any monitor
+        bool IsVisible(int wx, int wy)
+        {
+            foreach (var a in areas)
+            {
+                int ix = Math.Max(0, Math.Min(wx + w, a.Right) - Math.Max(wx, a.Left));
+                int iy = Math.Max(0, Math.Min(wy + h, a.Bottom) - Math.Max(wy, a.Top));
+                if (ix >= 200 && iy >= 80) return true;
+            }
+            return false;
+        }
+
+        if (x != int.MinValue && y != int.MinValue && IsVisible(x, y))
+            return; // Position is valid
+
+        // Center on primary monitor (first in enumeration, or largest work area)
+        var primary = areas[0];
+        // Find the monitor with the largest work area as fallback
+        foreach (var a in areas)
+        {
+            if ((a.Right - a.Left) * (a.Bottom - a.Top) >
+                (primary.Right - primary.Left) * (primary.Bottom - primary.Top))
+                primary = a;
+        }
+        x = primary.Left + (primary.Right - primary.Left - w) / 2;
+        y = primary.Bottom - h - 80;
     }
 
     public void Dispose()

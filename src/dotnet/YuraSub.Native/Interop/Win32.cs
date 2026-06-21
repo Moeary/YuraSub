@@ -362,7 +362,22 @@ internal static class Win32
         public uint dwFlags;
     }
 
+    public const uint MONITOR_DEFAULTTONULL = 0;
+    public const uint MONITOR_DEFAULTTOPRIMARY = 1;
     public const uint MONITOR_DEFAULTTONEAREST = 2;
+
+    // --- Monitor enumeration callback ---
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    public delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumDelegate lpfnEnum, IntPtr dwData);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr MonitorFromRect(ref RECT lprc, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr GetModuleHandleW(string? lpModuleName);

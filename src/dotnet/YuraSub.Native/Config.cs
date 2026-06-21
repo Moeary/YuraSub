@@ -167,6 +167,43 @@ internal static class Config
     }
 
     /// <summary>
+    /// Sanitize window config: fix 0x0, negative, off-screen values.
+    /// Call after Load() and before passing config to OverlayWindow.
+    /// </summary>
+    public static void SanitizeWindow(JsonObject config)
+    {
+        if (!config.TryGetValue("window", out var w) || w is not JsonObject win)
+            return;
+
+        // Fix width/height
+        int width = GetInt(config, "window", "width", Defaults.WindowWidth);
+        int height = GetInt(config, "window", "height", Defaults.WindowHeight);
+        if (width < 280) { width = Defaults.WindowWidth; win["width"] = width; }
+        if (height < 80) { height = Defaults.WindowHeight; win["height"] = height; }
+
+        // Fix x/y: null is OK (OverlayWindow will center), but invalid values need fixing
+        if (win.TryGetValue("x", out var xVal) && xVal is not JsonNull &&
+            win.TryGetValue("y", out var yVal) && yVal is not JsonNull)
+        {
+            int x = xVal is JsonNumber xn ? xn.ToInt() : int.MinValue;
+            int y = yVal is JsonNumber yn ? yn.ToInt() : int.MinValue;
+            if (x == int.MinValue || y == int.MinValue)
+            {
+                // Invalid values — reset to null so OverlayWindow will center
+                win["x"] = JsonNull.Instance;
+                win["y"] = JsonNull.Instance;
+            }
+        }
+
+        // Locked + clickThrough is fine, tray can always recover
+        // But ensure the flags are boolean
+        if (win.TryGetValue("locked", out var lk) && lk is not JsonBool)
+            win["locked"] = false;
+        if (win.TryGetValue("clickThrough", out var ct) && ct is not JsonBool)
+            win["clickThrough"] = false;
+    }
+
+    /// <summary>
     /// Get a nested int value from config.
     /// </summary>
     public static int GetInt(JsonObject config, string section, string key, int defaultValue)

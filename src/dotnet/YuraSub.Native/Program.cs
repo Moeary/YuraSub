@@ -76,6 +76,7 @@ internal static class Program
         // Load config
         string resolvedPath = Config.ResolvePath(configPath);
         JsonObject config = Config.Load(resolvedPath);
+        Config.SanitizeWindow(config);
 
         // CLI overrides
         var serverCfg = config.TryGetValue("server", out var s) && s is JsonObject sObj ? sObj : new JsonObject();

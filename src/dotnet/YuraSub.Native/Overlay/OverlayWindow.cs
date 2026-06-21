@@ -102,6 +102,10 @@ internal sealed class OverlayWindow : IDisposable
     // Rendering mode: true = ULW (transparent), false = HWND RT (black bg, visible)
     private bool _useUlw = true;
     private int _ulwZeroAlphaCount;
+    private int _renderRetryCount;
+
+    // D2DERR_RECREATE_TARGET — recoverable, not fatal
+    private const int D2DERR_RECREATE_TARGET = unchecked((int)0x88990001);
 
     // HWND render target (fallback path)
     private IntPtr _renderTarget;
@@ -830,16 +834,19 @@ internal sealed class OverlayWindow : IDisposable
             int newW = Math.Max(280, _dragStartWidth + dx);
             int newH = Math.Max(80, _dragStartHeight + dy);
             Win32.MoveWindow(_hwnd, _dragStartLeft, _dragStartTop, newW, newH, true);
+            // Size changed — full redraw (recreates DIB if needed)
             RequestRepaint();
         }
         else if (_dragMode == "move")
         {
-            // Use screen coordinates for accurate dragging
+            // Move only — no redraw needed, just reposition and re-present existing DIB
             Win32.GetCursorPos(out var screenPt);
             int newX = screenPt.X - (_dragStartX - _dragStartLeft);
             int newY = screenPt.Y - (_dragStartY - _dragStartTop);
             Win32.MoveWindow(_hwnd, newX, newY, _dragStartWidth, _dragStartHeight, true);
-            RequestRepaint();
+            // Just re-present the existing DIB at the new position (no BeginDraw/EndDraw)
+            if (_useUlw && _memDC != IntPtr.Zero)
+                UpdateLayeredWindowPresent(_dragStartWidth, _dragStartHeight);
         }
     }
 
@@ -1190,15 +1197,15 @@ internal sealed class OverlayWindow : IDisposable
     private int _lastAlphaNonZero;
 
     /// <summary>
-    /// Switch from ULW path to HWND render target path.
-    /// Called when ULW produces zero alpha pixels or fails.
+    /// Fatal fallback: switch from ULW to HWND render target (black background).
+    /// This is a last-resort recovery, not a normal code path.
     /// </summary>
-    private void FallbackToHwndRt()
+    private void FatalFallbackToHwndRt(string reason)
     {
         if (!_useUlw) return; // Already in fallback mode
         _useUlw = false;
-        LogToFile("FALLBACK: Switching from ULW to HWND render target");
-        OnLog?.Invoke("Falling back to HWND render target (black background)");
+        LogToFile($"FATAL FALLBACK to HWND RT (black bg): {reason}");
+        OnLog?.Invoke($"Fatal fallback to HWND RT: {reason}");
 
         // Release ULW resources
         ReleaseRenderSurface();
@@ -1226,6 +1233,34 @@ internal sealed class OverlayWindow : IDisposable
         {
             LogToFile($"HWND RT fallback ALSO FAILED: {ex.Message}");
             ShowError($"YuraSub rendering failed:\n{ex.Message}\n\nBoth ULW and HWND RT paths failed.");
+        }
+    }
+
+    /// <summary>
+    /// Attempt to recover ULW transparent rendering after a fatal fallback.
+    /// </summary>
+    public void RecoverUlwTransparent()
+    {
+        if (_useUlw) return; // Already in ULW mode
+        LogToFile("Attempting ULW transparent recovery...");
+
+        // Release HWND render target
+        if (_renderTarget != IntPtr.Zero) { D2DFactory.Release(_renderTarget); _renderTarget = IntPtr.Zero; }
+
+        try
+        {
+            _useUlw = true;
+            _ulwZeroAlphaCount = 0;
+            _renderRetryCount = 0;
+            RecreateRenderSurface();
+            LogToFile("ULW transparent recovery successful");
+            RenderFrame();
+        }
+        catch (Exception ex)
+        {
+            LogToFile($"ULW recovery failed: {ex.Message}");
+            _useUlw = false;
+            FatalFallbackToHwndRt($"ULW recovery failed: {ex.Message}");
         }
     }
 
@@ -1426,6 +1461,11 @@ internal sealed class OverlayWindow : IDisposable
 
     private void RenderFrame()
     {
+        RenderFrameInternal(0);
+    }
+
+    private void RenderFrameInternal(int retryDepth)
+    {
         if (!_d2dInitialized || _dcRenderTarget == IntPtr.Zero) return;
 
         Win32.GetClientRect(_hwnd, out var clientRect);
@@ -1439,7 +1479,7 @@ internal sealed class OverlayWindow : IDisposable
             catch (Exception ex)
             {
                 LogToFile($"RecreateRenderSurface failed: {ex.Message}");
-                FallbackToHwndRt();
+                FatalFallbackToHwndRt($"RecreateRenderSurface failed: {ex.Message}");
                 return;
             }
         }
@@ -1455,15 +1495,33 @@ internal sealed class OverlayWindow : IDisposable
         int endDrawHr = D2DFactory.EndDraw(_drawRt);
         if (endDrawHr != 0)
         {
-            string msg = $"EndDraw failed: 0x{endDrawHr:X8}";
+            // D2DERR_RECREATE_TARGET is recoverable — recreate surface and retry
+            if (endDrawHr == D2DERR_RECREATE_TARGET && retryDepth < 2)
+            {
+                LogToFile($"EndDraw D2DERR_RECREATE_TARGET, recreating surface (retry {retryDepth + 1})");
+                try
+                {
+                    ReleaseRenderSurface();
+                    RecreateRenderSurface();
+                    RenderFrameInternal(retryDepth + 1);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    LogToFile($"Recreate after D2DERR_RECREATE_TARGET failed: {ex.Message}");
+                }
+            }
+
+            // Non-recoverable EndDraw error or retry exhausted
+            string msg = $"EndDraw failed: 0x{endDrawHr:X8} (retry={retryDepth})";
             LogToFile(msg);
-            OnLog?.Invoke(msg);
-            FallbackToHwndRt();
+            FatalFallbackToHwndRt(msg);
             return;
         }
 
         // Alpha diagnostic: count non-zero alpha pixels in DIB
         _renderFrameCount++;
+        _renderRetryCount = 0; // Reset retry counter on success
         int alphaNonZero = CountNonZeroAlphaPixels(w, h);
         _lastAlphaNonZero = alphaNonZero;
 
@@ -1481,8 +1539,8 @@ internal sealed class OverlayWindow : IDisposable
             _ulwZeroAlphaCount++;
             if (_ulwZeroAlphaCount >= 3)
             {
-                LogToFile($"ULW produced 0 alpha pixels for {_ulwZeroAlphaCount} consecutive frames, falling back");
-                FallbackToHwndRt();
+                LogToFile($"ULW produced 0 alpha pixels for {_ulwZeroAlphaCount} consecutive frames");
+                FatalFallbackToHwndRt("ULW produced 0 alpha pixels for 3+ consecutive frames");
                 return;
             }
         }
@@ -1492,7 +1550,15 @@ internal sealed class OverlayWindow : IDisposable
         }
 
         // Present via UpdateLayeredWindow
-        // pptDst = window screen position, pptSrc = source DC origin
+        UpdateLayeredWindowPresent(w, h);
+    }
+
+    /// <summary>
+    /// Present the current DIB via UpdateLayeredWindow.
+    /// Can be called independently (e.g., after move without redraw).
+    /// </summary>
+    private void UpdateLayeredWindowPresent(int w, int h)
+    {
         Win32.GetWindowRect(_hwnd, out var winRect);
         var destPt = new Win32.POINT { X = winRect.Left, Y = winRect.Top };
         var srcPt = new Win32.POINT { X = 0, Y = 0 };
@@ -1508,10 +1574,8 @@ internal sealed class OverlayWindow : IDisposable
         if (!ulwOk)
         {
             int err = Marshal.GetLastWin32Error();
-            string msg = $"UpdateLayeredWindow failed: error={err}, dest=({destPt.X},{destPt.Y}), size={w}x{h}";
-            LogToFile(msg);
-            OnLog?.Invoke(msg);
-            FallbackToHwndRt();
+            LogToFile($"UpdateLayeredWindow failed: error={err}, dest=({destPt.X},{destPt.Y}), size={w}x{h}");
+            // Don't fallback on single ULW failure — just log and continue
         }
     }
 

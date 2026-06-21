@@ -175,11 +175,30 @@ internal static class Config
         if (!config.TryGetValue("window", out var w) || w is not JsonObject win)
             return;
 
-        // Fix width/height
+        // Fix width/height — use 400x100 as "reasonable minimum" to catch
+        // configs saved from broken states (e.g., 280x80 at 0,0 from a failed ULW run)
         int width = GetInt(config, "window", "width", Defaults.WindowWidth);
         int height = GetInt(config, "window", "height", Defaults.WindowHeight);
-        if (width < 280) { width = Defaults.WindowWidth; win["width"] = width; }
-        if (height < 80) { height = Defaults.WindowHeight; win["height"] = height; }
+        int winX = GetInt(config, "window", "x", int.MinValue);
+        int winY = GetInt(config, "window", "y", int.MinValue);
+
+        bool sizeSuspicious = (width < 400 || height < 100);
+        bool posSuspicious = (winX == 0 && winY == 0) || (winX == int.MinValue || winY == int.MinValue);
+
+        // If both size and position look like a broken saved state, reset to defaults
+        if (sizeSuspicious && posSuspicious)
+        {
+            win["width"] = Defaults.WindowWidth;
+            win["height"] = Defaults.WindowHeight;
+            win["x"] = JsonNull.Instance;
+            win["y"] = JsonNull.Instance;
+        }
+        else
+        {
+            // Enforce hard minimums
+            if (width < 280) win["width"] = 280;
+            if (height < 80) win["height"] = 80;
+        }
 
         // Fix x/y: null is OK (OverlayWindow will center), but invalid values need fixing
         if (win.TryGetValue("x", out var xVal) && xVal is not JsonNull &&

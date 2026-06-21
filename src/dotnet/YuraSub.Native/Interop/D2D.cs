@@ -140,6 +140,38 @@ internal static class D2DFactory
     //   CreateDrawingStateBlock(12), CreateWicBitmapRenderTarget(13), CreateHwndRenderTarget(14),
     //   CreateDxgiSurfaceRenderTarget(15), CreateDCRenderTarget(16)
 
+    // --- ID2D1Factory vtable ---
+    // IUnknown: QueryInterface(0), AddRef(1), Release(2)
+    // ID2D1Factory: ReloadSystemMetrics(3), GetDesktopDpi(4), CreateRectangleGeometry(5),
+    //   CreateRoundedRectangleGeometry(6), CreateEllipseGeometry(7), CreateGeometryGroup(8),
+    //   CreateTransformedGeometry(9), CreatePathGeometry(10), CreateStrokeStyle(11),
+    //   CreateDrawingStateBlock(12), CreateWicBitmapRenderTarget(13), CreateHwndRenderTarget(14),
+    //   CreateDxgiSurfaceRenderTarget(15), CreateDCRenderTarget(16)
+
+    internal static unsafe IntPtr CreateDCRenderTarget(IntPtr factory, D2D1_RENDER_TARGET_PROPERTIES props)
+    {
+        IntPtr dcrt;
+        var fn = (delegate* unmanaged[Stdcall]<IntPtr, D2D1_RENDER_TARGET_PROPERTIES*, IntPtr*, int>)GetVTableFunction(factory, 16);
+        D2D1_RENDER_TARGET_PROPERTIES localProps = props;
+        int hr = fn(factory, &localProps, &dcrt);
+        if (hr != 0) throw new InvalidOperationException($"CreateDCRenderTarget failed: 0x{hr:X8}");
+        return dcrt;
+    }
+
+    // --- ID2D1DCRenderTarget::BindDC ---
+    // vtable: ID2D1RT(0-56) + ID2D1DCRT::BindDC(57)
+    // Note: ID2D1BitmapRT::GetBitmap is NOT in the DCRT vtable because
+    // ID2D1DCRenderTarget inherits directly from ID2D1RenderTarget in practice.
+    internal static unsafe void BindDC(IntPtr dcrt, IntPtr hdc, ref Win32.RECT rect)
+    {
+        fixed (Win32.RECT* pRect = &rect)
+        {
+            var fn = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, Win32.RECT*, int>)GetVTableFunction(dcrt, 57);
+            int hr = fn(dcrt, hdc, pRect);
+            if (hr != 0) throw new InvalidOperationException($"BindDC failed: 0x{hr:X8}");
+        }
+    }
+
     internal static IntPtr CreateHwndRenderTarget(IntPtr factory, IntPtr hwnd, int width, int height)
     {
         unsafe
@@ -206,13 +238,13 @@ internal static class D2DFactory
         }
     }
 
-    internal static void EndDraw(IntPtr rt)
+    internal static int EndDraw(IntPtr rt)
     {
         unsafe
         {
             ulong tag1, tag2;
             var fn = (delegate* unmanaged[Stdcall]<IntPtr, ulong*, ulong*, int>)GetVTableFunction(rt, 49);
-            fn(rt, &tag1, &tag2);
+            return fn(rt, &tag1, &tag2);
         }
     }
 
@@ -279,6 +311,19 @@ internal static class D2DFactory
         {
             var fn = (delegate* unmanaged[Stdcall]<IntPtr, D2D1_RECT_F*, IntPtr, void>)GetVTableFunction(rt, 17);
             fn(rt, &rect, brush);
+        }
+    }
+
+    // ID2D1RenderTarget::DrawEllipse vtable index = 20
+    internal static void DrawEllipse(IntPtr rt, float cx, float cy, float rx, float ry, IntPtr brush, float strokeWidth, IntPtr strokeStyle)
+    {
+        unsafe
+        {
+            // D2D1_ELLIPSE = { D2D1_POINT_2F, float, float }
+            var ellipse = stackalloc float[4]; // cx, cy, rx, ry
+            ellipse[0] = cx; ellipse[1] = cy; ellipse[2] = rx; ellipse[3] = ry;
+            var fn = (delegate* unmanaged[Stdcall]<IntPtr, float*, IntPtr, float, IntPtr, void>)GetVTableFunction(rt, 20);
+            fn(rt, ellipse, brush, strokeWidth, strokeStyle);
         }
     }
 

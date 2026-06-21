@@ -320,6 +320,12 @@ internal static class Win32
     [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr GetFocus();
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetDC(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool ReleaseCapture();
 
@@ -365,6 +371,66 @@ internal static class Win32
     public const uint MONITOR_DEFAULTTONULL = 0;
     public const uint MONITOR_DEFAULTTOPRIMARY = 1;
     public const uint MONITOR_DEFAULTTONEAREST = 2;
+
+    // --- UpdateLayeredWindow ---
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINTL
+    {
+        public int X, Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SIZE
+    {
+        public int cx, cy;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BLENDFUNCTION
+    {
+        public byte BlendOp;
+        public byte BlendFlags;
+        public byte SourceConstantAlpha;
+        public byte AlphaFormat;
+    }
+
+    public const byte AC_SRC_ALPHA = 0x01;
+    public const uint ULW_ALPHA = 0x00000002;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UpdateLayeredWindow(
+        IntPtr hWnd, IntPtr hdcDst, IntPtr pptDst, IntPtr psize,
+        IntPtr hdcSrc, IntPtr pptSrc, uint crKey, ref BLENDFUNCTION pblend, uint dwFlags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UpdateLayeredWindow(
+        IntPtr hWnd, IntPtr hdcDst, ref POINT pptDst, ref SIZE psize,
+        IntPtr hdcSrc, ref POINT pptSrc, uint crKey, ref BLENDFUNCTION pblend, uint dwFlags);
+
+    // --- ChooseColorW ---
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CHOOSECOLORW
+    {
+        public int lStructSize;
+        public IntPtr hwndOwner;
+        public IntPtr hInstance;
+        public int rgbResult;
+        public IntPtr lpCustColors;
+        public uint Flags;
+        public IntPtr lCustData;
+        public IntPtr lpfnHook;
+        public IntPtr lpTemplateName;
+        public IntPtr pvReserved;
+        public uint dwReserved;
+        public uint FlagsEx;
+    }
+
+    public const uint CC_RGBINIT = 0x00000001;
+    public const uint CC_FULLOPEN = 0x00000002;
+    public const uint CC_SOLIDCOLOR = 0x00000080;
+
+    [DllImport("comdlg32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool ChooseColorW(ref CHOOSECOLORW lpcc);
 
     // --- Monitor enumeration callback ---
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]

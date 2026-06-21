@@ -9,6 +9,7 @@ namespace YuraSub.Native.Overlay;
 
 /// <summary>
 /// Main overlay window with Direct2D rendering, drag/resize, lock/click-through.
+/// Uses a DC render target + UpdateLayeredWindow for true per-pixel alpha transparency.
 /// </summary>
 internal sealed class OverlayWindow : IDisposable
 {
@@ -31,6 +32,9 @@ internal sealed class OverlayWindow : IDisposable
     private string? _dragMode;
     private int _dragStartX, _dragStartY;
     private int _dragStartLeft, _dragStartTop, _dragStartWidth, _dragStartHeight;
+
+    // Local geometry override — suppresses remote geometry after manual drag/resize
+    private bool _localGeometryOverride;
 
     // Style defaults
     private static readonly JsonObject DefaultStyle = new()
@@ -81,13 +85,34 @@ internal sealed class OverlayWindow : IDisposable
     private IntPtr _hInstance;
     private Win32.WndProcDelegate? _wndProc; // prevent GC
 
-    // Direct2D
+    // Direct2D — DC render target (for UpdateLayeredWindow)
     private IntPtr _d2dFactory;
     private IntPtr _dwriteFactory;
+    private IntPtr _dcRenderTarget;
+    private int _dcRTWidth;
+    private int _dcRTHeight;
+    private bool _d2dInitialized;
+
+    // DIB section for UpdateLayeredWindow
+    private IntPtr _dibSection;
+    private IntPtr _dibPixels;
+    private IntPtr _dibDC;
+    private IntPtr _memDC;
+
+    // Rendering mode: true = ULW (transparent), false = HWND RT (black bg, visible)
+    private bool _useUlw = true;
+    private int _ulwZeroAlphaCount;
+
+    // HWND render target (fallback path)
     private IntPtr _renderTarget;
     private int _renderTargetWidth;
     private int _renderTargetHeight;
-    private bool _d2dInitialized;
+
+    // Active draw target — set to _dcRenderTarget (ULW) or _renderTarget (HWND RT) before drawing
+    private IntPtr _drawRt;
+
+    // Custom colors for ChooseColorW (16 COLORREF entries, pinned)
+    private int[] _custColors = new int[16];
 
     // Events
     public event Action<string>? OnMediaCommand;
@@ -96,6 +121,20 @@ internal sealed class OverlayWindow : IDisposable
     public event Action<bool>? OnLockChanged;
     public event Action<JsonObject>? OnStyleChanged;
     public event Action<string>? OnLog;
+
+    // Log file path (always writable, even for WinExe without console)
+    private static readonly string LogFilePath = System.IO.Path.Combine(AppContext.BaseDirectory, "yurasub-native.log");
+
+    private static void LogToFile(string msg)
+    {
+        try { System.IO.File.AppendAllText(LogFilePath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {msg}\n"); }
+        catch { }
+    }
+
+    private static void ShowError(string msg)
+    {
+        Win32.MessageBoxW(IntPtr.Zero, msg, "YuraSub", Win32.MB_OK | Win32.MB_ICONERROR);
+    }
 
     // Tray menu IDs
     private const int TRAY_ID_TOGGLE_INTERACTIVE = 1001;
@@ -177,12 +216,15 @@ internal sealed class OverlayWindow : IDisposable
         winH = Math.Max(80, winH);
 
         int winX, winY;
+        bool hasExplicitPos = false;
         if (_config.TryGetValue("window", out var w) && w is JsonObject winObj &&
             winObj.TryGetValue("x", out var xVal) && xVal is not JsonNull &&
             winObj.TryGetValue("y", out var yVal) && yVal is not JsonNull)
         {
             winX = xVal is JsonNumber xn ? xn.ToInt() : int.MinValue;
             winY = yVal is JsonNumber yn ? yn.ToInt() : int.MinValue;
+            if (winX != int.MinValue && winY != int.MinValue)
+                hasExplicitPos = true;
         }
         else
         {
@@ -190,18 +232,13 @@ internal sealed class OverlayWindow : IDisposable
             winY = int.MinValue;
         }
 
-        // Validate position against monitor work areas
+        // Validate position against primary monitor
         ClampToMonitor(ref winX, ref winY, winW, winH);
 
         _hwnd = Win32.CreateWindowExW(exStyle, className, "YuraSub", style,
             winX, winY, winW, winH, IntPtr.Zero, IntPtr.Zero, _hInstance, IntPtr.Zero);
 
         if (_hwnd == IntPtr.Zero) return false;
-
-        // Make transparent — use LWA_ALPHA (0x02), NOT LWA_COLORKEY (0x01).
-        // LWA_COLORKEY would make all RGB(0,0,0) pixels fully transparent,
-        // breaking shadows and causing visual artifacts.
-        Win32.SetLayeredWindowAttributes(_hwnd, 0, 255, 0x02); // LWA_ALPHA
 
         // Restore lock state
         if (_config.TryGetValue("window", out var winCfg) && winCfg is JsonObject wObj)
@@ -212,10 +249,17 @@ internal sealed class OverlayWindow : IDisposable
                 SetClickThrough(false);
         }
 
-        Win32.ShowWindow(_hwnd, Win32.SW_SHOWNOACTIVATE);
+        // If config had explicit x/y, mark as local override
+        if (hasExplicitPos)
+            _localGeometryOverride = true;
+
         InitD2D();
+        Win32.ShowWindow(_hwnd, Win32.SW_SHOWNOACTIVATE);
+        RenderFrame();
         return true;
     }
+
+    // --- D2D / DIB initialization ---
 
     private void InitD2D()
     {
@@ -223,27 +267,133 @@ internal sealed class OverlayWindow : IDisposable
         {
             _d2dFactory = D2DFactory.CreateD2DFactory();
             _dwriteFactory = D2DFactory.CreateDWriteFactory();
-
-            Win32.GetClientRect(_hwnd, out var rect);
-            int w = rect.Right - rect.Left;
-            int h = rect.Bottom - rect.Top;
-            _renderTarget = D2DFactory.CreateHwndRenderTarget(_d2dFactory, _hwnd, Math.Max(w, 1), Math.Max(h, 1));
-            _renderTargetWidth = Math.Max(w, 1);
-            _renderTargetHeight = Math.Max(h, 1);
-            D2DFactory.SetTextAntialiasMode(_renderTarget, 1); // D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE
             _d2dInitialized = true;
+
+            // Try ULW path first (transparent)
+            if (_useUlw)
+            {
+                try
+                {
+                    RecreateRenderSurface();
+                    LogToFile("ULW render surface created successfully");
+                }
+                catch (Exception ulwEx)
+                {
+                    LogToFile($"ULW init FAILED, falling back to HWND RT: {ulwEx.Message}");
+                    OnLog?.Invoke($"ULW init failed: {ulwEx.Message}");
+                    _useUlw = false;
+                    ReleaseRenderSurface();
+                }
+            }
+
+            // Fallback: HWND render target (black background, always visible)
+            if (!_useUlw)
+            {
+                Win32.GetClientRect(_hwnd, out var rect);
+                int w = Math.Max(1, rect.Right - rect.Left);
+                int h = Math.Max(1, rect.Bottom - rect.Top);
+                _renderTarget = D2DFactory.CreateHwndRenderTarget(_d2dFactory, _hwnd, w, h);
+                _renderTargetWidth = w;
+                _renderTargetHeight = h;
+                D2DFactory.SetTextAntialiasMode(_renderTarget, 1);
+                LogToFile($"HWND render target created: {w}x{h}");
+            }
         }
         catch (Exception ex)
         {
+            LogToFile($"D2D init FAILED completely: {ex.Message}");
             OnLog?.Invoke($"D2D init failed: {ex.Message}");
             _d2dInitialized = false;
+            ShowError($"YuraSub D2D init failed:\n{ex.Message}\n\nThe overlay may not render correctly.");
         }
+    }
+
+    /// <summary>
+    /// Recreate DIB, memory DC, and DC render target when window size changes.
+    /// </summary>
+    private void RecreateRenderSurface()
+    {
+        Win32.GetClientRect(_hwnd, out var rect);
+        int w = Math.Max(1, rect.Right - rect.Left);
+        int h = Math.Max(1, rect.Bottom - rect.Top);
+
+        if (_dcRTWidth == w && _dcRTHeight == h && _dcRenderTarget != IntPtr.Zero)
+            return; // No size change
+
+        // Release old resources
+        ReleaseRenderSurface();
+
+        _dcRTWidth = w;
+        _dcRTHeight = h;
+
+        // Create DIB section (32-bit BGRA, top-down)
+        var bmi = new Win32.BITMAPINFO
+        {
+            bmiHeader = new Win32.BITMAPINFOHEADER
+            {
+                biSize = Marshal.SizeOf<Win32.BITMAPINFOHEADER>(),
+                biWidth = w,
+                biHeight = -h, // Top-down
+                biPlanes = 1,
+                biBitCount = 32,
+                biCompression = (int)Win32.BI_RGB,
+            }
+        };
+        _dibSection = Win32.CreateDIBSection(IntPtr.Zero, ref bmi, Win32.DIB_RGB_COLORS, out _dibPixels, IntPtr.Zero, 0);
+        if (_dibSection == IntPtr.Zero)
+        {
+            int err = Marshal.GetLastWin32Error();
+            throw new InvalidOperationException($"CreateDIBSection failed: size={w}x{h}, error={err}");
+        }
+
+        // Create memory DC and select DIB
+        _dibDC = Win32.GetDC(IntPtr.Zero);
+        if (_dibDC == IntPtr.Zero)
+            throw new InvalidOperationException("GetDC(screen) failed");
+
+        _memDC = Win32.CreateCompatibleDC(_dibDC);
+        if (_memDC == IntPtr.Zero)
+            throw new InvalidOperationException("CreateCompatibleDC failed");
+
+        IntPtr oldBmp = Win32.SelectObject(_memDC, _dibSection);
+        if (oldBmp == IntPtr.Zero)
+            throw new InvalidOperationException("SelectObject(DIB) failed");
+
+        // Create DC render target
+        var rtProps = new D2D1_RENDER_TARGET_PROPERTIES
+        {
+            Type = 0,
+            PixelFormat = new D2D1_PIXEL_FORMAT
+            {
+                Format = 87, // DXGI_FORMAT_B8G8R8A8_UNORM
+                AlphaMode = 1, // D2D1_ALPHA_MODE_PREMULTIPLIED
+            },
+            DpiX = 0, DpiY = 0,
+            Usage = 0, MinLevel = 0,
+        };
+        _dcRenderTarget = D2DFactory.CreateDCRenderTarget(_d2dFactory, rtProps);
+        D2DFactory.SetTextAntialiasMode(_dcRenderTarget, 1); // CLEARTYPE
+
+        // Bind to memory DC
+        var bindRect = new Win32.RECT { Left = 0, Top = 0, Right = w, Bottom = h };
+        D2DFactory.BindDC(_dcRenderTarget, _memDC, ref bindRect);
+
+        OnLog?.Invoke($"Render surface created: {w}x{h}, DIB=0x{_dibSection:X}, memDC=0x{_memDC:X}, dcRT=0x{_dcRenderTarget:X}");
+    }
+
+    private void ReleaseRenderSurface()
+    {
+        if (_dcRenderTarget != IntPtr.Zero) { D2DFactory.Release(_dcRenderTarget); _dcRenderTarget = IntPtr.Zero; }
+        if (_memDC != IntPtr.Zero) { Win32.DeleteDC(_memDC); _memDC = IntPtr.Zero; }
+        if (_dibDC != IntPtr.Zero) { Win32.ReleaseDC(IntPtr.Zero, _dibDC); _dibDC = IntPtr.Zero; }
+        if (_dibSection != IntPtr.Zero) { Win32.DeleteObject(_dibSection); _dibSection = IntPtr.Zero; }
+        _dibPixels = IntPtr.Zero;
     }
 
     public void Show()
     {
         Win32.ShowWindow(_hwnd, Win32.SW_SHOWNOACTIVATE);
-        RequestRepaint();
+        RenderFrame();
     }
 
     public void Hide() => Win32.ShowWindow(_hwnd, Win32.SW_HIDE);
@@ -251,14 +401,19 @@ internal sealed class OverlayWindow : IDisposable
     {
         Win32.SetWindowPos(_hwnd, Win32.HWND_TOPMOST, 0, 0, 0, 0,
             Win32.SWP_NOMOVE | Win32.SWP_NOSIZE | Win32.SWP_SHOWWINDOW);
-        RequestRepaint();
+        RenderFrame();
     }
 
     private void RequestRepaint()
     {
         if (_hwnd == IntPtr.Zero) return;
-        Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
-        Win32.UpdateWindow(_hwnd);
+        if (_useUlw)
+            RenderFrame();
+        else
+        {
+            Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+            Win32.UpdateWindow(_hwnd);
+        }
     }
 
     public void SetSubtitle(string text, string translation)
@@ -328,7 +483,7 @@ internal sealed class OverlayWindow : IDisposable
         var style = Payload.ExtractStyle(payload);
         if (style != null) ApplyStyle(style, false);
 
-        // Apply commands
+        // Apply commands (geometry guarded by _localGeometryOverride)
         ApplyCommand(payload);
 
         // Apply media
@@ -382,9 +537,12 @@ internal sealed class OverlayWindow : IDisposable
             if (parsed.HasValue) SetClickThrough(!parsed.Value);
         }
 
-        // geometry
+        // geometry — guarded by local override (like Python _localGeometry_override)
         if (payload.TryGetValue("geometry", out var g) && g is JsonObject geo)
-            ApplyGeometry(geo);
+        {
+            if (!_localGeometryOverride)
+                ApplyGeometry(geo);
+        }
     }
 
     private void ApplyMedia(JsonObject media)
@@ -421,8 +579,7 @@ internal sealed class OverlayWindow : IDisposable
         string anchor = geometry.TryGetValue("anchor", out var a) ? a.ToString() : "bottom";
         int marginBottom = geometry.TryGetValue("marginBottom", out var mb) && mb is JsonNumber mbn ? mbn.ToInt() : 80;
 
-        var areas = GetAllMonitorWorkAreas();
-        var primary = areas.Count > 0 ? areas[0] : new Win32.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
+        var primary = GetPrimaryMonitorWorkArea();
         int screenW = primary.Right - primary.Left;
         int screenH = primary.Bottom - primary.Top;
 
@@ -480,10 +637,11 @@ internal sealed class OverlayWindow : IDisposable
         _controlOpacityPercent = Config.Defaults.ControlOpacity;
         _controlBackgroundColorHex = Config.Defaults.ControlBackgroundColor;
         _controlBackgroundOpacityPercent = Config.Defaults.ControlBackgroundOpacity;
+        // Reset geometry override so remote geometry can apply again
+        _localGeometryOverride = false;
         UnlockForEditing();
 
-        var areas = GetAllMonitorWorkAreas();
-        var primary = areas.Count > 0 ? areas[0] : new Win32.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
+        var primary = GetPrimaryMonitorWorkArea();
         int screenW = primary.Right - primary.Left;
         int w = Math.Min(Config.Defaults.WindowWidth, (int)(screenW * 0.86));
         int x = primary.Left + (screenW - w) / 2;
@@ -499,7 +657,10 @@ internal sealed class OverlayWindow : IDisposable
         switch (msg)
         {
             case Win32.WM_PAINT:
-                OnPaint();
+                if (_useUlw)
+                    Win32.ValidateRect(_hwnd, IntPtr.Zero); // ULW path: validate only
+                else
+                    OnPaint(); // HWND RT path: paint normally
                 return IntPtr.Zero;
 
             case Win32.WM_LBUTTONDOWN:
@@ -611,7 +772,6 @@ internal sealed class OverlayWindow : IDisposable
             if (_mediaDuration > 0)
             {
                 int x = GetXL(lParam);
-                Win32.GetClientRect(_hwnd, out var rect);
                 float ratio = (float)(x - _sliderX) / _sliderW;
                 ratio = Math.Max(0, Math.Min(1, ratio));
                 double seekTime = _mediaDuration * ratio;
@@ -625,6 +785,10 @@ internal sealed class OverlayWindow : IDisposable
 
         if (_dragMode != null)
         {
+            // After manual move/resize, set local geometry override
+            // so remote geometry from subtitle payloads doesn't snap us back
+            if (_dragMode == "move" || _dragMode == "resize")
+                _localGeometryOverride = true;
             _dragMode = null;
             Win32.ReleaseCapture();
         }
@@ -712,16 +876,16 @@ internal sealed class OverlayWindow : IDisposable
                 RequestRepaint();
                 break;
             case "textColor":
-                CycleStyleColor("textColor");
+                ShowColorPicker("textColor");
                 break;
             case "outlineColor":
-                CycleStyleColor("outlineColor");
+                ShowColorPicker("outlineColor");
                 break;
             case "controlColor":
-                CycleControlColor();
+                ShowColorPickerControl("controlColor");
                 break;
             case "controlBackground":
-                CycleControlBackgroundColor();
+                ShowColorPickerControl("controlBackground");
                 break;
             case "controlBackgroundOpacityDown":
                 StepControlBackgroundOpacity(-10);
@@ -776,6 +940,83 @@ internal sealed class OverlayWindow : IDisposable
         _controlBackgroundOpacityPercent = Math.Max(0, Math.Min(100, _controlBackgroundOpacityPercent + delta));
         OnStyleChanged?.Invoke(_style);
         RequestRepaint();
+    }
+
+    // --- Color picker ---
+
+    private void ShowColorPicker(string styleKey)
+    {
+        string currentHex = GetStyleString(styleKey, "#ffffff");
+        int currentOpacity = GetStyleInt(styleKey + "Opacity", 100);
+
+        // Parse current color to COLORREF (BGR format for Windows)
+        ParseColor(currentHex, 100, out float r, out float g, out float b, out _);
+        int colorRef = ((int)(b * 255) << 16) | ((int)(g * 255) << 8) | (int)(r * 255);
+
+        var cc = new Win32.CHOOSECOLORW
+        {
+            lStructSize = Marshal.SizeOf<Win32.CHOOSECOLORW>(),
+            hwndOwner = _hwnd,
+            rgbResult = colorRef,
+            lpCustColors = Marshal.AllocHGlobal(16 * 4),
+            Flags = Win32.CC_RGBINIT | Win32.CC_FULLOPEN,
+        };
+
+        // Copy custom colors to unmanaged memory
+        Marshal.Copy(_custColors, 0, cc.lpCustColors, 16);
+
+        bool ok = Win32.ChooseColorW(ref cc);
+
+        // Copy back
+        Marshal.Copy(cc.lpCustColors, _custColors, 0, 16);
+        Marshal.FreeHGlobal(cc.lpCustColors);
+
+        if (ok)
+        {
+            int cr = cc.rgbResult;
+            string newHex = $"#{(cr & 0xFF):x2}{((cr >> 8) & 0xFF):x2}{((cr >> 16) & 0xFF):x2}";
+            var style = new JsonObject { [styleKey] = newHex };
+            ApplyStyle(style, true);
+        }
+    }
+
+    private void ShowColorPickerControl(string controlKey)
+    {
+        string currentHex;
+        if (controlKey == "controlColor")
+            currentHex = _controlColorHex;
+        else
+            currentHex = _controlBackgroundColorHex;
+
+        ParseColor(currentHex, 100, out float r, out float g, out float b, out _);
+        int colorRef = ((int)(b * 255) << 16) | ((int)(g * 255) << 8) | (int)(r * 255);
+
+        var cc = new Win32.CHOOSECOLORW
+        {
+            lStructSize = Marshal.SizeOf<Win32.CHOOSECOLORW>(),
+            hwndOwner = _hwnd,
+            rgbResult = colorRef,
+            lpCustColors = Marshal.AllocHGlobal(16 * 4),
+            Flags = Win32.CC_RGBINIT | Win32.CC_FULLOPEN,
+        };
+        Marshal.Copy(_custColors, 0, cc.lpCustColors, 16);
+
+        bool ok = Win32.ChooseColorW(ref cc);
+
+        Marshal.Copy(cc.lpCustColors, _custColors, 0, 16);
+        Marshal.FreeHGlobal(cc.lpCustColors);
+
+        if (ok)
+        {
+            int cr = cc.rgbResult;
+            string newHex = $"#{(cr & 0xFF):x2}{((cr >> 8) & 0xFF):x2}{((cr >> 16) & 0xFF):x2}";
+            if (controlKey == "controlColor")
+                _controlColorHex = newHex;
+            else
+                _controlBackgroundColorHex = newHex;
+            OnStyleChanged?.Invoke(_style);
+            RequestRepaint();
+        }
     }
 
     private static string NextPaletteColor(string current)
@@ -943,10 +1184,58 @@ internal sealed class OverlayWindow : IDisposable
         }
     }
 
-    // --- Painting ---
+    // --- Rendering (DC render target + UpdateLayeredWindow) ---
+
+    private int _renderFrameCount;
+    private int _lastAlphaNonZero;
+
+    /// <summary>
+    /// Switch from ULW path to HWND render target path.
+    /// Called when ULW produces zero alpha pixels or fails.
+    /// </summary>
+    private void FallbackToHwndRt()
+    {
+        if (!_useUlw) return; // Already in fallback mode
+        _useUlw = false;
+        LogToFile("FALLBACK: Switching from ULW to HWND render target");
+        OnLog?.Invoke("Falling back to HWND render target (black background)");
+
+        // Release ULW resources
+        ReleaseRenderSurface();
+
+        // Create HWND render target
+        Win32.GetClientRect(_hwnd, out var rect);
+        int w = Math.Max(1, rect.Right - rect.Left);
+        int h = Math.Max(1, rect.Bottom - rect.Top);
+        try
+        {
+            _renderTarget = D2DFactory.CreateHwndRenderTarget(_d2dFactory, _hwnd, w, h);
+            _renderTargetWidth = w;
+            _renderTargetHeight = h;
+            D2DFactory.SetTextAntialiasMode(_renderTarget, 1);
+            LogToFile($"HWND render target created: {w}x{h}");
+
+            // Re-apply layered window attributes for HWND RT path
+            Win32.SetLayeredWindowAttributes(_hwnd, 0, 255, 0x02); // LWA_ALPHA
+
+            // Trigger a repaint via WM_PAINT
+            Win32.InvalidateRect(_hwnd, IntPtr.Zero, false);
+            Win32.UpdateWindow(_hwnd);
+        }
+        catch (Exception ex)
+        {
+            LogToFile($"HWND RT fallback ALSO FAILED: {ex.Message}");
+            ShowError($"YuraSub rendering failed:\n{ex.Message}\n\nBoth ULW and HWND RT paths failed.");
+        }
+    }
+
+    /// <summary>
+    /// OnPaint handler for HWND render target fallback path.
+    /// Renders directly to the HWND render target (black background, but visible).
+    /// </summary>
     private void OnPaint()
     {
-        if (!_d2dInitialized)
+        if (!_d2dInitialized || _renderTarget == IntPtr.Zero)
         {
             Win32.ValidateRect(_hwnd, IntPtr.Zero);
             return;
@@ -964,9 +1253,24 @@ internal sealed class OverlayWindow : IDisposable
             _renderTargetHeight = h;
         }
 
-        D2DFactory.BeginDraw(_renderTarget);
-        D2DFactory.Clear(_renderTarget, new D2D1_COLOR_F { R = 0, G = 0, B = 0, A = 0 }); // Transparent
+        _drawRt = _renderTarget;
+        D2DFactory.BeginDraw(_drawRt);
+        D2DFactory.Clear(_drawRt, new D2D1_COLOR_F { R = 0, G = 0, B = 0, A = 1.0f }); // Black background
 
+        // Draw all content — uses _drawRt which is set to _renderTarget
+        DrawToolbarAndContent(w, h);
+
+        D2DFactory.EndDraw(_drawRt);
+        Win32.ValidateRect(_hwnd, IntPtr.Zero);
+    }
+
+    /// <summary>
+    /// Draw all toolbar, subtitle, border, and grip content.
+    /// Uses _drawRt which must be set before calling.
+    /// Shared by both ULW (RenderFrame) and HWND RT (OnPaint) paths.
+    /// </summary>
+    private void DrawToolbarAndContent(int w, int h)
+    {
         // Build control buttons
         _controlButtons.Clear();
         if (!_locked)
@@ -984,7 +1288,7 @@ internal sealed class OverlayWindow : IDisposable
 
             AddButton("A+", "增大字号", "fontBigger", ref btnX, btnY, 40, btnH, gap);
             AddButton("A-", "减小字号", "fontSmaller", ref btnX, btnY, 40, btnH, gap);
-            AddButton("◀▌", "上一首", "previousTrack", ref btnX, btnY, 44, btnH, gap);
+            AddButton("", "上一首", "previousTrack", ref btnX, btnY, 44, btnH, gap);
 
             // Slider
             _sliderX = btnX;
@@ -995,15 +1299,14 @@ internal sealed class OverlayWindow : IDisposable
 
             // Time label
             string timeText = FormatTime(_mediaPosition) + " / " + FormatTime(_mediaDuration);
-            // We'll draw this as text, not a button
             float timeX = btnX;
             btnX += 96 + gap;
 
-            AddButton("▐▶", "下一首", "nextTrack", ref btnX, btnY, 44, btnH, gap);
-            AddButton(_mediaPaused ? "▶" : "Ⅱ", "播放/暂停", "playPause", ref btnX, btnY, 40, btnH, gap);
+            AddButton("", "下一首", "nextTrack", ref btnX, btnY, 44, btnH, gap);
+            AddButton("", "播放/暂停", "playPause", ref btnX, btnY, 40, btnH, gap);
             AddButton("◐", "样式", "style", ref btnX, btnY, 36, btnH, gap);
             AddButton("×", "清空字幕", "clear", ref btnX, btnY, 36, btnH, gap);
-            AddButton("▣", "锁定并点击穿透", "lock", ref btnX, btnY, 36, btnH, gap);
+            AddButton("", "锁定并点击穿透", "lock", ref btnX, btnY, 36, btnH, gap);
 
             // Draw controls background
             ParseColor(_controlBackgroundColorHex, _controlBackgroundOpacityPercent, out float bgR, out float bgG, out float bgB, out float bgA);
@@ -1013,24 +1316,37 @@ internal sealed class OverlayWindow : IDisposable
                 RadiusX = 12,
                 RadiusY = 12,
             };
-            var bgBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = bgR, G = bgG, B = bgB, A = bgA });
-            D2DFactory.FillRoundedRect(_renderTarget, controlBg, bgBrush);
+            var bgBrush = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F { R = bgR, G = bgG, B = bgB, A = bgA });
+            D2DFactory.FillRoundedRect(_drawRt, controlBg, bgBrush);
             D2DFactory.Release(bgBrush);
 
             // Draw border
-            var borderBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = 229f/255, G = 241f/255, B = 232f/255, A = 0.07f });
-            D2DFactory.DrawRoundedRect(_renderTarget, controlBg, borderBrush, 1, IntPtr.Zero);
+            var borderBrush = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F { R = 229f/255, G = 241f/255, B = 232f/255, A = 0.07f });
+            D2DFactory.DrawRoundedRect(_drawRt, controlBg, borderBrush, 1, IntPtr.Zero);
             D2DFactory.Release(borderBrush);
 
             // Parse control color
             ParseColor(_controlColorHex, _controlOpacityPercent, out float ccR, out float ccG, out float ccB, out float ccA);
             var controlColor = new D2D1_COLOR_F { R = ccR, G = ccG, B = ccB, A = ccA };
 
-            // Draw buttons
-            var btnBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, controlColor);
+            // Draw vector buttons
+            var btnBrush = D2DFactory.CreateSolidColorBrush(_drawRt, controlColor);
             foreach (var btn in _controlButtons)
             {
-                DrawText(btn.Label, btn.X + 4, btn.Y + 2, btn.W - 8, btn.H - 4, btnBrush, 20, 700);
+                if (btn.Command == "previousTrack")
+                    DrawPreviousButton(btn.X, btn.Y, btn.W, btn.H, btnBrush);
+                else if (btn.Command == "nextTrack")
+                    DrawNextButton(btn.X, btn.Y, btn.W, btn.H, btnBrush);
+                else if (btn.Command == "playPause")
+                    DrawPlayPauseButton(btn.X, btn.Y, btn.W, btn.H, btnBrush);
+                else if (btn.Command == "lock")
+                    DrawLockButton(btn.X, btn.Y, btn.W, btn.H, btnBrush);
+                else if (btn.Command == "clear")
+                    DrawClearButton(btn.X, btn.Y, btn.W, btn.H, btnBrush);
+                else if (btn.Command == "style")
+                    DrawStyleButton(btn.X, btn.Y, btn.W, btn.H, btnBrush);
+                else
+                    DrawText(btn.Label, btn.X + 4, btn.Y + 2, btn.W - 8, btn.H - 4, btnBrush, 20, 700);
             }
 
             // Draw slider
@@ -1069,8 +1385,8 @@ internal sealed class OverlayWindow : IDisposable
                             RadiusX = radius,
                             RadiusY = radius,
                         };
-                        var bg = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = bgR, G = bgG, B = bgB, A = bgA });
-                        D2DFactory.FillRoundedRect(_renderTarget, bgRect, bg);
+                        var bg = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F { R = bgR, G = bgG, B = bgB, A = bgA });
+                        D2DFactory.FillRoundedRect(_drawRt, bgRect, bg);
                         D2DFactory.Release(bg);
                     }
                 }
@@ -1082,33 +1398,297 @@ internal sealed class OverlayWindow : IDisposable
         if (!_clickThrough)
         {
             var borderC = new D2D1_COLOR_F { R = 125f/255, G = 211f/255, B = 252f/255, A = 0.47f };
-            var borderB = D2DFactory.CreateSolidColorBrush(_renderTarget, borderC);
+            var borderB = D2DFactory.CreateSolidColorBrush(_drawRt, borderC);
             var borderRect = new D2D1_ROUNDED_RECT
             {
                 Rect = new D2D1_RECT_F { Left = 1, Top = 1, Right = w - 2, Bottom = h - 2 },
                 RadiusX = 10,
                 RadiusY = 10,
             };
-            D2DFactory.DrawRoundedRect(_renderTarget, borderRect, borderB, 1.5f, IntPtr.Zero);
+            D2DFactory.DrawRoundedRect(_drawRt, borderRect, borderB, 1.5f, IntPtr.Zero);
 
             // Grip lines
             ParseColor(_controlColorHex, _controlOpacityPercent, out float gcR, out float gcG, out float gcB, out float gcA);
-            var gripBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = gcR, G = gcG, B = gcB, A = Math.Max(0, gcA - 0.02f) });
+            var gripBrush = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F { R = gcR, G = gcG, B = gcB, A = Math.Max(0, gcA - 0.02f) });
             float gx = w - 24, gy = h - 24;
-            D2DFactory.DrawLine(_renderTarget,
+            D2DFactory.DrawLine(_drawRt,
                 new D2D1_POINT_2F { X = gx, Y = gy + 16 },
                 new D2D1_POINT_2F { X = gx + 16, Y = gy },
                 gripBrush, 2, IntPtr.Zero);
-            D2DFactory.DrawLine(_renderTarget,
+            D2DFactory.DrawLine(_drawRt,
                 new D2D1_POINT_2F { X = gx + 6, Y = gy + 16 },
                 new D2D1_POINT_2F { X = gx + 16, Y = gy + 6 },
                 gripBrush, 2, IntPtr.Zero);
             D2DFactory.Release(gripBrush);
             D2DFactory.Release(borderB);
         }
+    }
 
-        D2DFactory.EndDraw(_renderTarget);
-        Win32.ValidateRect(_hwnd, IntPtr.Zero);
+    private void RenderFrame()
+    {
+        if (!_d2dInitialized || _dcRenderTarget == IntPtr.Zero) return;
+
+        Win32.GetClientRect(_hwnd, out var clientRect);
+        int w = Math.Max(1, clientRect.Right - clientRect.Left);
+        int h = Math.Max(1, clientRect.Bottom - clientRect.Top);
+
+        // Recreate DIB if size changed
+        if (_dcRTWidth != w || _dcRTHeight != h)
+        {
+            try { RecreateRenderSurface(); }
+            catch (Exception ex)
+            {
+                LogToFile($"RecreateRenderSurface failed: {ex.Message}");
+                FallbackToHwndRt();
+                return;
+            }
+        }
+
+        if (_dcRenderTarget == IntPtr.Zero || _memDC == IntPtr.Zero) return;
+
+        _drawRt = _dcRenderTarget;
+        D2DFactory.BeginDraw(_drawRt);
+        D2DFactory.Clear(_drawRt, new D2D1_COLOR_F { R = 0, G = 0, B = 0, A = 0 }); // Fully transparent
+
+        DrawToolbarAndContent(w, h);
+
+        int endDrawHr = D2DFactory.EndDraw(_drawRt);
+        if (endDrawHr != 0)
+        {
+            string msg = $"EndDraw failed: 0x{endDrawHr:X8}";
+            LogToFile(msg);
+            OnLog?.Invoke(msg);
+            FallbackToHwndRt();
+            return;
+        }
+
+        // Alpha diagnostic: count non-zero alpha pixels in DIB
+        _renderFrameCount++;
+        int alphaNonZero = CountNonZeroAlphaPixels(w, h);
+        _lastAlphaNonZero = alphaNonZero;
+
+        if (_renderFrameCount <= 5 || _renderFrameCount % 60 == 0)
+        {
+            if (alphaNonZero == 0)
+                LogToFile($"RenderFrame #{_renderFrameCount}: 0 non-zero alpha pixels ({w}x{h}), locked={_locked}");
+            else if (_renderFrameCount <= 5)
+                LogToFile($"RenderFrame #{_renderFrameCount}: {alphaNonZero} non-zero alpha pixels ({w}x{h})");
+        }
+
+        // If alpha is zero for 3+ consecutive frames, the ULW path is broken
+        if (alphaNonZero == 0 && !_locked)
+        {
+            _ulwZeroAlphaCount++;
+            if (_ulwZeroAlphaCount >= 3)
+            {
+                LogToFile($"ULW produced 0 alpha pixels for {_ulwZeroAlphaCount} consecutive frames, falling back");
+                FallbackToHwndRt();
+                return;
+            }
+        }
+        else
+        {
+            _ulwZeroAlphaCount = 0;
+        }
+
+        // Present via UpdateLayeredWindow
+        // pptDst = window screen position, pptSrc = source DC origin
+        Win32.GetWindowRect(_hwnd, out var winRect);
+        var destPt = new Win32.POINT { X = winRect.Left, Y = winRect.Top };
+        var srcPt = new Win32.POINT { X = 0, Y = 0 };
+        var size = new Win32.SIZE { cx = w, cy = h };
+        var blend = new Win32.BLENDFUNCTION
+        {
+            BlendOp = 0, // AC_SRC_OVER
+            BlendFlags = 0,
+            SourceConstantAlpha = 255,
+            AlphaFormat = Win32.AC_SRC_ALPHA,
+        };
+        bool ulwOk = Win32.UpdateLayeredWindow(_hwnd, IntPtr.Zero, ref destPt, ref size, _memDC, ref srcPt, 0, ref blend, Win32.ULW_ALPHA);
+        if (!ulwOk)
+        {
+            int err = Marshal.GetLastWin32Error();
+            string msg = $"UpdateLayeredWindow failed: error={err}, dest=({destPt.X},{destPt.Y}), size={w}x{h}";
+            LogToFile(msg);
+            OnLog?.Invoke(msg);
+            FallbackToHwndRt();
+        }
+    }
+
+    /// <summary>
+    /// Diagnostic: count pixels with alpha > 0 in the DIB.
+    /// </summary>
+    private unsafe int CountNonZeroAlphaPixels(int w, int h)
+    {
+        if (_dibPixels == IntPtr.Zero) return -1;
+        int count = 0;
+        uint* pixels = (uint*)_dibPixels;
+        int total = w * h;
+        for (int i = 0; i < total; i++)
+        {
+            if ((pixels[i] & 0xFF000000) != 0) // Alpha in bits 24-31 for BGRA
+                count++;
+        }
+        return count;
+    }
+
+    // --- Vector button drawing ---
+
+    private void DrawPreviousButton(float x, float y, float w, float h, IntPtr brush)
+    {
+        float cx = x + w / 2f;
+        float cy = y + h / 2f;
+        float s = h * 0.32f; // Size scale
+        // Triangle pointing left: (cx+s/2, cy-s) → (cx-s/2, cy) → (cx+s/2, cy+s)
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx + s * 0.5f, Y = cy - s },
+            new D2D1_POINT_2F { X = cx - s * 0.5f, Y = cy },
+            brush, 2, IntPtr.Zero);
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx - s * 0.5f, Y = cy },
+            new D2D1_POINT_2F { X = cx + s * 0.5f, Y = cy + s },
+            brush, 2, IntPtr.Zero);
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx + s * 0.5f, Y = cy + s },
+            new D2D1_POINT_2F { X = cx + s * 0.5f, Y = cy - s },
+            brush, 2, IntPtr.Zero);
+        // Vertical bar
+        float barX = cx - s * 0.8f;
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = barX, Y = cy - s },
+            new D2D1_POINT_2F { X = barX, Y = cy + s },
+            brush, 2.5f, IntPtr.Zero);
+    }
+
+    private void DrawNextButton(float x, float y, float w, float h, IntPtr brush)
+    {
+        float cx = x + w / 2f;
+        float cy = y + h / 2f;
+        float s = h * 0.32f;
+        // Triangle pointing right: (cx-s/2, cy-s) → (cx+s/2, cy) → (cx-s/2, cy+s)
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx - s * 0.5f, Y = cy - s },
+            new D2D1_POINT_2F { X = cx + s * 0.5f, Y = cy },
+            brush, 2, IntPtr.Zero);
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx + s * 0.5f, Y = cy },
+            new D2D1_POINT_2F { X = cx - s * 0.5f, Y = cy + s },
+            brush, 2, IntPtr.Zero);
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx - s * 0.5f, Y = cy + s },
+            new D2D1_POINT_2F { X = cx - s * 0.5f, Y = cy - s },
+            brush, 2, IntPtr.Zero);
+        // Vertical bar
+        float barX = cx + s * 0.8f;
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = barX, Y = cy - s },
+            new D2D1_POINT_2F { X = barX, Y = cy + s },
+            brush, 2.5f, IntPtr.Zero);
+    }
+
+    private void DrawPlayPauseButton(float x, float y, float w, float h, IntPtr brush)
+    {
+        float cx = x + w / 2f;
+        float cy = y + h / 2f;
+        float s = h * 0.35f;
+
+        if (_mediaPaused)
+        {
+            // Play: right-pointing triangle
+            D2DFactory.DrawLine(_drawRt,
+                new D2D1_POINT_2F { X = cx - s * 0.5f, Y = cy - s },
+                new D2D1_POINT_2F { X = cx + s * 0.7f, Y = cy },
+                brush, 2, IntPtr.Zero);
+            D2DFactory.DrawLine(_drawRt,
+                new D2D1_POINT_2F { X = cx + s * 0.7f, Y = cy },
+                new D2D1_POINT_2F { X = cx - s * 0.5f, Y = cy + s },
+                brush, 2, IntPtr.Zero);
+            D2DFactory.DrawLine(_drawRt,
+                new D2D1_POINT_2F { X = cx - s * 0.5f, Y = cy + s },
+                new D2D1_POINT_2F { X = cx - s * 0.5f, Y = cy - s },
+                brush, 2, IntPtr.Zero);
+        }
+        else
+        {
+            // Pause: two vertical bars
+            float barW = s * 0.25f;
+            float gap = s * 0.25f;
+            D2DFactory.FillRectangle(_drawRt,
+                new D2D1_RECT_F { Left = cx - gap - barW, Top = cy - s, Right = cx - gap, Bottom = cy + s },
+                brush);
+            D2DFactory.FillRectangle(_drawRt,
+                new D2D1_RECT_F { Left = cx + gap, Top = cy - s, Right = cx + gap + barW, Bottom = cy + s },
+                brush);
+        }
+    }
+
+    private void DrawLockButton(float x, float y, float w, float h, IntPtr brush)
+    {
+        float cx = x + w / 2f;
+        float cy = y + h / 2f;
+        float s = h * 0.3f;
+
+        // Padlock body: rectangle
+        float bodyW = s * 1.4f;
+        float bodyH = s * 1.0f;
+        float bodyTop = cy;
+        D2DFactory.DrawRectangle(_drawRt,
+            new D2D1_RECT_F { Left = cx - bodyW / 2, Top = bodyTop, Right = cx + bodyW / 2, Bottom = bodyTop + bodyH },
+            brush, 2, IntPtr.Zero);
+
+        // Shackle: arc (approximate with lines)
+        float shackleW = bodyW * 0.6f;
+        float shackleH = s * 0.7f;
+        float shackleTop = bodyTop - shackleH;
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx - shackleW / 2, Y = bodyTop },
+            new D2D1_POINT_2F { X = cx - shackleW / 2, Y = shackleTop + shackleW / 2 },
+            brush, 2, IntPtr.Zero);
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx - shackleW / 2, Y = shackleTop + shackleW / 2 },
+            new D2D1_POINT_2F { X = cx, Y = shackleTop },
+            brush, 2, IntPtr.Zero);
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx, Y = shackleTop },
+            new D2D1_POINT_2F { X = cx + shackleW / 2, Y = shackleTop + shackleW / 2 },
+            brush, 2, IntPtr.Zero);
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx + shackleW / 2, Y = shackleTop + shackleW / 2 },
+            new D2D1_POINT_2F { X = cx + shackleW / 2, Y = bodyTop },
+            brush, 2, IntPtr.Zero);
+    }
+
+    private void DrawClearButton(float x, float y, float w, float h, IntPtr brush)
+    {
+        float cx = x + w / 2f;
+        float cy = y + h / 2f;
+        float s = h * 0.3f;
+
+        // X shape: two crossing diagonal lines
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx - s, Y = cy - s },
+            new D2D1_POINT_2F { X = cx + s, Y = cy + s },
+            brush, 2.5f, IntPtr.Zero);
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx + s, Y = cy - s },
+            new D2D1_POINT_2F { X = cx - s, Y = cy + s },
+            brush, 2.5f, IntPtr.Zero);
+    }
+
+    private void DrawStyleButton(float x, float y, float w, float h, IntPtr brush)
+    {
+        float cx = x + w / 2f;
+        float cy = y + h / 2f;
+        float r = h * 0.32f;
+
+        // Half-circle: draw full circle outline, fill left half
+        // Outer circle
+        D2DFactory.DrawEllipse(_drawRt, cx, cy, r, r, brush, 2, IntPtr.Zero);
+        // Vertical divider
+        D2DFactory.DrawLine(_drawRt,
+            new D2D1_POINT_2F { X = cx, Y = cy - r },
+            new D2D1_POINT_2F { X = cx, Y = cy + r },
+            brush, 1.5f, IntPtr.Zero);
     }
 
     private void DrawStylePanel(int w, float top, D2D1_COLOR_F controlColor, D2D1_COLOR_F controlBackground)
@@ -1124,31 +1704,31 @@ internal sealed class OverlayWindow : IDisposable
             RadiusY = 12,
         };
 
-        var bg = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F
+        var bg = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F
         {
             R = controlBackground.R,
             G = controlBackground.G,
             B = controlBackground.B,
             A = Math.Max(controlBackground.A, 30f / 255),
         });
-        D2DFactory.FillRoundedRect(_renderTarget, panelRect, bg);
+        D2DFactory.FillRoundedRect(_drawRt, panelRect, bg);
         D2DFactory.Release(bg);
 
-        var border = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = 229f / 255, G = 241f / 255, B = 232f / 255, A = 34f / 255 });
-        D2DFactory.DrawRoundedRect(_renderTarget, panelRect, border, 1, IntPtr.Zero);
+        var border = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F { R = 229f / 255, G = 241f / 255, B = 232f / 255, A = 34f / 255 });
+        D2DFactory.DrawRoundedRect(_drawRt, panelRect, border, 1, IntPtr.Zero);
         D2DFactory.Release(border);
 
-        var brush = D2DFactory.CreateSolidColorBrush(_renderTarget, controlColor);
+        var brush = D2DFactory.CreateSolidColorBrush(_drawRt, controlColor);
         float btnY = top + 6;
         float btnH = 34;
         float gap = 12;
         float totalW = 86 + 86 + 86 + 86 + 74 + 74 + gap * 5;
         float x = Math.Max(panelLeft + 14, (w - totalW) / 2);
 
-        AddButton("正文颜色", "循环正文颜色", "textColor", ref x, btnY, 86, btnH, gap);
-        AddButton("描边颜色", "循环描边颜色", "outlineColor", ref x, btnY, 86, btnH, gap);
-        AddButton("控件颜色", "循环控件颜色", "controlColor", ref x, btnY, 86, btnH, gap);
-        AddButton("控件背景", "循环控件背景颜色", "controlBackground", ref x, btnY, 86, btnH, gap);
+        AddButton("正文颜色", "选择正文颜色 (点击打开调色板)", "textColor", ref x, btnY, 86, btnH, gap);
+        AddButton("描边颜色", "选择描边颜色", "outlineColor", ref x, btnY, 86, btnH, gap);
+        AddButton("控件颜色", "选择控件颜色", "controlColor", ref x, btnY, 86, btnH, gap);
+        AddButton("控件背景", "选择控件背景颜色", "controlBackground", ref x, btnY, 86, btnH, gap);
         AddButton("背景-", "降低控件背景不透明度", "controlBackgroundOpacityDown", ref x, btnY, 74, btnH, gap);
         AddButton("背景+", "提高控件背景不透明度", "controlBackgroundOpacityUp", ref x, btnY, 74, btnH, gap);
 
@@ -1161,14 +1741,14 @@ internal sealed class OverlayWindow : IDisposable
                 RadiusX = 8,
                 RadiusY = 8,
             };
-            var bgBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F
+            var bgBrush = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F
             {
                 R = controlBackground.R,
                 G = controlBackground.G,
                 B = controlBackground.B,
                 A = Math.Max(0.10f, Math.Min(0.82f, controlBackground.A + 0.18f)),
             });
-            D2DFactory.FillRoundedRect(_renderTarget, buttonBg, bgBrush);
+            D2DFactory.FillRoundedRect(_drawRt, buttonBg, bgBrush);
             D2DFactory.Release(bgBrush);
             DrawText(btn.Label, btn.X + 4, btn.Y + 2, btn.W - 8, btn.H - 4, brush, 14, 600);
         }
@@ -1185,27 +1765,27 @@ internal sealed class OverlayWindow : IDisposable
     private void DrawSlider(float x, float y, float w, float h, D2D1_COLOR_F color)
     {
         // Track background
-        var trackBg = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = 245f/255, G = 255f/255, B = 248f/255, A = 0.21f });
+        var trackBg = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F { R = 245f/255, G = 255f/255, B = 248f/255, A = 0.21f });
         float trackY = y + h / 2 - 2;
         var trackRect = new D2D1_RECT_F { Left = x, Top = trackY, Right = x + w, Bottom = trackY + 4 };
-        D2DFactory.FillRectangle(_renderTarget, trackRect, trackBg);
+        D2DFactory.FillRectangle(_drawRt, trackRect, trackBg);
         D2DFactory.Release(trackBg);
 
         // Progress
         float progress = _mediaDuration > 0 ? (float)(_mediaPosition / _mediaDuration) : 0;
         progress = Math.Max(0, Math.Min(1, progress));
         var progressColor = new D2D1_COLOR_F { R = color.R, G = color.G, B = color.B, A = Math.Max(0, color.A - 0.16f) };
-        var progressBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, progressColor);
+        var progressBrush = D2DFactory.CreateSolidColorBrush(_drawRt, progressColor);
         var progressRect = new D2D1_RECT_F { Left = x, Top = trackY, Right = x + w * progress, Bottom = trackY + 4 };
-        D2DFactory.FillRectangle(_renderTarget, progressRect, progressBrush);
+        D2DFactory.FillRectangle(_drawRt, progressRect, progressBrush);
         D2DFactory.Release(progressBrush);
 
         // Handle
         float handleX = x + w * progress - 6;
         float handleY = y + h / 2 - 6;
-        var handleBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = color.R, G = color.G, B = color.B, A = Math.Max(0, color.A - 0.02f) });
+        var handleBrush = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F { R = color.R, G = color.G, B = color.B, A = Math.Max(0, color.A - 0.02f) });
         var handleRect = new D2D1_RECT_F { Left = handleX, Top = handleY, Right = handleX + 12, Bottom = handleY + 12 };
-        D2DFactory.FillRectangle(_renderTarget, handleRect, handleBrush);
+        D2DFactory.FillRectangle(_drawRt, handleRect, handleBrush);
         D2DFactory.Release(handleBrush);
     }
 
@@ -1279,7 +1859,6 @@ internal sealed class OverlayWindow : IDisposable
         foreach (var (text, isTranslation) in lines)
         {
             IntPtr format = isTranslation ? transFormat : mainFormat;
-            int fontSize = isTranslation ? transFontSize : mainFontSize;
 
             // Create text layout
             IntPtr layout = DWriteInterop.CreateTextLayout(_dwriteFactory, text, format, drawW, 200);
@@ -1287,24 +1866,23 @@ internal sealed class OverlayWindow : IDisposable
             float lineH = metrics.Height;
 
             float lineX = drawX;
-            float baseline = currentY + lineH * 0.8f; // Approximate baseline
 
             // Draw shadow
             if (sA > 0)
             {
-                var shadowBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = sR, G = sG, B = sB, A = sA });
+                var shadowBrush = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F { R = sR, G = sG, B = sB, A = sA });
                 var shadowTransform = Matrix3x2.CreateTranslation(shadowOffX, shadowOffY);
-                D2DFactory.SetTransform(_renderTarget, ref shadowTransform);
-                D2DFactory.DrawTextLayout(_renderTarget, lineX, currentY, layout, shadowBrush, 0);
+                D2DFactory.SetTransform(_drawRt, ref shadowTransform);
+                D2DFactory.DrawTextLayout(_drawRt, lineX, currentY, layout, shadowBrush, 0);
                 var identity = Matrix3x2.Identity;
-                D2DFactory.SetTransform(_renderTarget, ref identity);
+                D2DFactory.SetTransform(_drawRt, ref identity);
                 D2DFactory.Release(shadowBrush);
             }
 
             // Draw outline (simulate with multiple offset draws)
             if (outlineWidth > 0 && oA > 0)
             {
-                var outlineBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F { R = oR, G = oG, B = oB, A = oA });
+                var outlineBrush = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F { R = oR, G = oG, B = oB, A = oA });
                 float ow = outlineWidth;
                 for (float dx = -ow; dx <= ow; dx += 1)
                 {
@@ -1313,25 +1891,25 @@ internal sealed class OverlayWindow : IDisposable
                         if (dx * dx + dy * dy <= ow * ow)
                         {
                             var offsetTransform = Matrix3x2.CreateTranslation(dx, dy);
-                            D2DFactory.SetTransform(_renderTarget, ref offsetTransform);
-                            D2DFactory.DrawTextLayout(_renderTarget, lineX, currentY, layout, outlineBrush, 0);
+                            D2DFactory.SetTransform(_drawRt, ref offsetTransform);
+                            D2DFactory.DrawTextLayout(_drawRt, lineX, currentY, layout, outlineBrush, 0);
                         }
                     }
                 }
                 var resetTransform = Matrix3x2.Identity;
-                D2DFactory.SetTransform(_renderTarget, ref resetTransform);
+                D2DFactory.SetTransform(_drawRt, ref resetTransform);
                 D2DFactory.Release(outlineBrush);
             }
 
             // Draw main text
-            var textBrush = D2DFactory.CreateSolidColorBrush(_renderTarget, new D2D1_COLOR_F
+            var textBrush = D2DFactory.CreateSolidColorBrush(_drawRt, new D2D1_COLOR_F
             {
                 R = isTranslation ? trR : tR,
                 G = isTranslation ? trG : tG,
                 B = isTranslation ? trB : tB,
                 A = isTranslation ? trA : tA,
             });
-            D2DFactory.DrawTextLayout(_renderTarget, lineX, currentY, layout, textBrush, 0);
+            D2DFactory.DrawTextLayout(_drawRt, lineX, currentY, layout, textBrush, 0);
             D2DFactory.Release(textBrush);
 
             D2DFactory.Release(layout);
@@ -1351,7 +1929,7 @@ internal sealed class OverlayWindow : IDisposable
         DWriteInterop.SetTextAlignment(format, 2); // CENTER
         DWriteInterop.SetParagraphAlignment(format, 2); // CENTER
         IntPtr layout = DWriteInterop.CreateTextLayout(_dwriteFactory, text, format, w, h);
-        D2DFactory.DrawTextLayout(_renderTarget, x, y, layout, brush, 0);
+        D2DFactory.DrawTextLayout(_drawRt, x, y, layout, brush, 0);
         D2DFactory.Release(layout);
         D2DFactory.Release(format);
     }
@@ -1387,6 +1965,24 @@ internal sealed class OverlayWindow : IDisposable
     // --- Monitor helpers ---
 
     /// <summary>
+    /// Get work-area rect for the primary monitor.
+    /// Uses MonitorFromPoint(0,0, MONITOR_DEFAULTTOPRIMARY) for reliable primary detection.
+    /// </summary>
+    private static Win32.RECT GetPrimaryMonitorWorkArea()
+    {
+        // (0,0) is always on the primary monitor in virtual screen coordinates
+        IntPtr hMon = Win32.MonitorFromPoint(new Win32.POINT { X = 0, Y = 0 }, Win32.MONITOR_DEFAULTTOPRIMARY);
+        if (hMon != IntPtr.Zero)
+        {
+            var mi = new Win32.MONITORINFO { cbSize = Marshal.SizeOf<Win32.MONITORINFO>() };
+            if (Win32.GetMonitorInfoW(hMon, ref mi))
+                return mi.rcWork;
+        }
+        // Fallback
+        return new Win32.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
+    }
+
+    /// <summary>
     /// Get work-area rects for all monitors.
     /// </summary>
     private static List<Win32.RECT> GetAllMonitorWorkAreas()
@@ -1405,16 +2001,16 @@ internal sealed class OverlayWindow : IDisposable
 
     /// <summary>
     /// Clamp a window position so at least 200×80 pixels are visible on some monitor.
-    /// If position is int.MinValue or off-screen, center on primary monitor.
+    /// If position is int.MinValue or off-screen, place on primary monitor.
     /// </summary>
     private static void ClampToMonitor(ref int x, ref int y, int w, int h)
     {
         var areas = GetAllMonitorWorkAreas();
         if (areas.Count == 0)
         {
-            // Fallback: center on assumed 1920×1080
-            x = (1920 - w) / 2;
-            y = 1080 - h - 80;
+            var primary = GetPrimaryMonitorWorkArea();
+            x = primary.Left + (primary.Right - primary.Left - w) / 2;
+            y = primary.Bottom - h - 80;
             return;
         }
 
@@ -1433,17 +2029,10 @@ internal sealed class OverlayWindow : IDisposable
         if (x != int.MinValue && y != int.MinValue && IsVisible(x, y))
             return; // Position is valid
 
-        // Center on primary monitor (first in enumeration, or largest work area)
-        var primary = areas[0];
-        // Find the monitor with the largest work area as fallback
-        foreach (var a in areas)
-        {
-            if ((a.Right - a.Left) * (a.Bottom - a.Top) >
-                (primary.Right - primary.Left) * (primary.Bottom - primary.Top))
-                primary = a;
-        }
-        x = primary.Left + (primary.Right - primary.Left - w) / 2;
-        y = primary.Bottom - h - 80;
+        // Use primary monitor (not largest)
+        var primaryArea = GetPrimaryMonitorWorkArea();
+        x = primaryArea.Left + (primaryArea.Right - primaryArea.Left - w) / 2;
+        y = primaryArea.Bottom - h - 80;
     }
 
     public void Dispose()
@@ -1459,6 +2048,8 @@ internal sealed class OverlayWindow : IDisposable
             Win32.Shell_NotifyIconW(Win32.NIM_DELETE, ref nid);
         }
 
+        ReleaseRenderSurface();
+        if (_dcRenderTarget != IntPtr.Zero) D2DFactory.Release(_dcRenderTarget);
         if (_renderTarget != IntPtr.Zero) D2DFactory.Release(_renderTarget);
         if (_d2dFactory != IntPtr.Zero) D2DFactory.Release(_d2dFactory);
         if (_dwriteFactory != IntPtr.Zero) D2DFactory.Release(_dwriteFactory);
